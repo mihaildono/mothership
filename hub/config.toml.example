@@ -1,0 +1,25 @@
+# Mothership — Hub Agent Configuration
+# Copy this file to config.toml and fill in your values.
+
+# Unique identifier for this hub (e.g. "hub-001")
+hub_id     = "hub-001"
+
+# Auth token issued by the orchestrator admin (UUID)
+auth_token = "replace-with-your-uuid"
+
+# Work window — hub will connect and process tasks only during this time range
+# Format: "HH:MM" (24-hour). Default below: all day.
+work_start = "00:00"
+work_end   = "23:59"
+
+[orchestrator]
+# Nebula overlay IP assigned to the orchestrator node
+nebula_ip = "10.10.0.1"
+# Port the orchestrator's FastAPI WebSocket server listens on
+ws_port   = 8765
+
+[ollama]
+# Model to load and use for inference
+model = "gemma4:e2b"
+# Ollama local API base URL (default, no change needed)
+host  = "http://localhost:11434"
