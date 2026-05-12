@@ -1,0 +1,24 @@
+# Mothership — Child Node Configuration
+# Copy this file to config.toml and fill in your values.
+
+# Unique identifier for this child (e.g. "child-001")
+child_id   = "child-001"
+
+# Auth token issued by the mother admin (UUID)
+auth_token = "replace-with-your-uuid"
+
+# Work window — child will connect and process tasks only during this time range
+# Format: "HH:MM" (24-hour). Default below: all day.
+work_start = "00:00"
+work_end   = "23:59"
+
+[mother]
+# Use 127.0.0.1 for local testing; replace with Nebula IP when overlay is set up
+host    = "10.10.0.1"
+ws_port = 8765
+
+[ollama]
+# Model to load and use for inference
+model = "gemma4:e2b"
+# Ollama local API base URL (default, no change needed)
+host  = "http://localhost:11434"

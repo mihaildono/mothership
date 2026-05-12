@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Config (contains secrets)
+child/config.toml
+mother/config.toml
+
+# SQLite database
+*.db
+*.sqlite3
