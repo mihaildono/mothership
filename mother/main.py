@@ -17,15 +17,21 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import secrets
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Security, Depends
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, field_validator
 
 from child_registry import ChildRegistry
 import health as health_module
@@ -38,10 +44,46 @@ logger = logging.getLogger("mother")
 
 registry = ChildRegistry()
 
+# ── API key auth for REST endpoints ──────────────────────────────────────────
+# Set MOTHER_API_KEY env var before starting. If unset, REST endpoints are
+# only accessible from localhost (enforced below).
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+_MOTHER_API_KEY = os.environ.get("MOTHER_API_KEY", "")
+
+
+def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
+    if not _MOTHER_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: MOTHER_API_KEY not set")
+    if not key or not secrets.compare_digest(key, _MOTHER_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+
+# ── Auth token registry for children ─────────────────────────────────────────
+# Maps child_id → expected auth_token (hex string).
+# Loaded from MOTHER_CHILD_TOKENS env var: "child-001=token1,child-002=token2"
+def _load_child_tokens() -> dict[str, str]:
+    raw = os.environ.get("MOTHER_CHILD_TOKENS", "")
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            cid, tok = pair.split("=", 1)
+            result[cid.strip()] = tok.strip()
+    return result
+
+_CHILD_TOKENS: dict[str, str] = _load_child_tokens()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.results = {}
+    if not _MOTHER_API_KEY:
+        raise RuntimeError("MOTHER_API_KEY env var is required but not set")
+    if not _CHILD_TOKENS:
+        logger.warning("MOTHER_CHILD_TOKENS not set — no children can register!")
     logger.info("Mother starting up...")
     health_task = asyncio.create_task(health_module.run(registry))
     yield
@@ -74,6 +116,21 @@ async def ws_child(ws: WebSocket):
             return
 
         child_id = msg["child_id"]
+
+        # Validate child_id format to prevent injection
+        if not child_id.replace("-", "").replace("_", "").isalnum():
+            await ws.close(code=4001, reason="Invalid child_id")
+            return
+
+        # Validate auth_token if we have a registry
+        if _CHILD_TOKENS:
+            supplied = msg.get("auth_token", "")
+            expected = _CHILD_TOKENS.get(child_id, "")
+            if not expected or not secrets.compare_digest(supplied, expected):
+                logger.warning("Auth failed for child '%s' — rejecting", child_id)
+                await ws.close(code=4003, reason="Invalid auth_token")
+                return
+
         await registry.register(child_id, ws)
 
         # Message loop
@@ -128,9 +185,12 @@ async def _handle_message(child_id: str, msg: dict) -> None:
 # ── REST endpoints ────────────────────────────────────────────────────────────
 
 
-@app.get("/children")
+@app.get("/children", dependencies=[Depends(_require_api_key)])
 async def list_children() -> JSONResponse:
     return JSONResponse(registry.snapshot())
+
+
+_MAX_PROMPT_LEN = 10_000  # characters
 
 
 class SendRequest(BaseModel):
@@ -138,8 +198,22 @@ class SendRequest(BaseModel):
     task_id: str
     prompt: str
 
+    @field_validator("prompt")
+    @classmethod
+    def prompt_length(cls, v: str) -> str:
+        if len(v) > _MAX_PROMPT_LEN:
+            raise ValueError(f"Prompt exceeds maximum length of {_MAX_PROMPT_LEN} characters")
+        return v
 
-@app.post("/send")
+    @field_validator("child_id", "task_id")
+    @classmethod
+    def safe_id(cls, v: str) -> str:
+        if not v.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("Invalid characters in id field")
+        return v
+
+
+@app.post("/send", dependencies=[Depends(_require_api_key)])
 async def send_to_child(body: SendRequest) -> JSONResponse:
     entry = registry.get(body.child_id)
     if not entry:
@@ -159,12 +233,60 @@ async def send_to_child(body: SendRequest) -> JSONResponse:
     return JSONResponse({"queued": True, "task_id": body.task_id})
 
 
-@app.get("/result/{task_id}")
+@app.get("/result/{task_id}", dependencies=[Depends(_require_api_key)])
 async def get_result(task_id: str) -> JSONResponse:
     result = app.state.results.get(task_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Result not ready yet")
     return JSONResponse(result)
+
+
+# ── Bundle distribution ───────────────────────────────────────────────────────
+# Serves pre-built child bundles for one-command child setup.
+# Protected by a per-child token stored in nebula/bundles/<child_id>.token
+
+_BUNDLES_DIR = Path(__file__).parent.parent / "nebula" / "bundles"
+
+
+@app.get("/bundle/{child_id}")
+async def get_bundle(child_id: str, token: str = Query(...)) -> FileResponse:
+    # Validate child_id to prevent path traversal
+    if not child_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid child_id")
+
+    token_file = _BUNDLES_DIR / f"{child_id}.token"
+    bundle_file = _BUNDLES_DIR / f"{child_id}.tar.gz"
+
+    if not bundle_file.exists():
+        raise HTTPException(status_code=404, detail=f"No bundle found for '{child_id}'")
+
+    if not token_file.exists():
+        raise HTTPException(status_code=403, detail="Bundle token not configured or already used")
+
+    try:
+        import json as _json
+        token_data = _json.loads(token_file.read_text())
+        expected = token_data["token"]
+        expires_at = float(token_data["expires_at"])
+    except Exception:
+        raise HTTPException(status_code=403, detail="Malformed token file")
+
+    if time.time() > expires_at:
+        token_file.unlink(missing_ok=True)
+        raise HTTPException(status_code=403, detail="Bundle token has expired")
+
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    # One-time use — delete token immediately before serving
+    token_file.unlink(missing_ok=True)
+    logger.info("Bundle served for %s — token invalidated", child_id)
+
+    return FileResponse(
+        path=bundle_file,
+        filename=f"{child_id}.tar.gz",
+        media_type="application/gzip",
+    )
 
 
 if __name__ == "__main__":

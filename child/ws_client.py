@@ -44,6 +44,7 @@ async def run(cfg: ChildConfig, on_status: StatusCallback) -> None:
                         {
                             "type": "CHILD_REGISTER",
                             "child_id": cfg.child_id,
+                            "auth_token": cfg.auth_token,
                         }
                     )
                 )

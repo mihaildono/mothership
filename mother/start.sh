@@ -4,6 +4,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# ── Load .env ─────────────────────────────────────────────────────────────────
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo ""
+    echo "  ERROR: $ENV_FILE not found."
+    echo "  Run nebula/setup-mother.sh first to generate keys."
+    echo ""
+    exit 1
+fi
+# Export each non-comment line as an env var
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
 
 # ── uv ────────────────────────────────────────────────────────────────────────
 export PATH="$HOME/.local/bin:$PATH"

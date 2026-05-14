@@ -1,0 +1,45 @@
+pki:
+  ca: /etc/nebula/ca.crt
+  cert: /etc/nebula/mother.crt
+  key: /etc/nebula/mother.key
+
+static_host_map:
+  # Mother is its own lighthouse — no external entry needed
+
+lighthouse:
+  am_lighthouse: true
+  interval: 60
+
+listen:
+  host: 0.0.0.0
+  port: 4242
+
+punchy:
+  punch: true
+
+tun:
+  disabled: false
+  dev: nebula1
+  drop_local_broadcast: false
+  drop_multicast: false
+  tx_queue: 500
+  mtu: 1300
+
+firewall:
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    # Allow ICMP (ping) from any Nebula node
+    - port: any
+      proto: icmp
+      host: any
+    # Allow children to connect on the WebSocket port
+    - port: 8765
+      proto: tcp
+      host: any
+
+logging:
+  level: info
+  format: text

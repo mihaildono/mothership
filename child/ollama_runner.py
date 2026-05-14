@@ -5,12 +5,29 @@ ollama_runner.py — start/stop the Ollama server process and run inference.
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import subprocess
 from typing import AsyncIterator
 
 import httpx
 
 _process: subprocess.Popen | None = None
+
+# Resolve ollama binary at import time — covers Homebrew (Intel + Apple Silicon),
+# system installs, and anything on PATH.
+def _find_ollama() -> str:
+    found = shutil.which("ollama")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "/usr/bin/ollama"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError(
+        "ollama binary not found. Install it from https://ollama.ai or brew install ollama"
+    )
+
+_OLLAMA_BIN = _find_ollama()
 
 
 async def start() -> None:
@@ -19,7 +36,7 @@ async def start() -> None:
     if _process and _process.poll() is None:
         return  # already running
     _process = subprocess.Popen(
-        ["ollama", "serve"],
+        [_OLLAMA_BIN, "serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
