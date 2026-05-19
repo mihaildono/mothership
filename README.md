@@ -71,7 +71,8 @@ Make sure **TCP 8765** and **UDP 4242** are reachable from child machines (open 
 ## Child setup — one command
 
 After `setup-mother.sh` finishes it prints a ready-to-run command per child.
-Copy it and run it on the child machine:
+
+### macOS / Linux
 
 ```bash
 curl -fsSL "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" \
@@ -87,43 +88,41 @@ curl -fsSL "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" \
 3. Starts Nebula as a system service
 4. Installs the child agent to `~/mothership-child/`
 5. Sets up Python environment (via `uv`)
-6. Installs and pulls the Ollama model
+6. Auto-detects best Ollama model for this hardware (`whichllm`)
 7. Registers the agent as a boot service
+
+### Windows
+
+1. Download the bundle (PowerShell):
+```powershell
+Invoke-WebRequest "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" -OutFile child-001.tar.gz
+tar -xzf child-001.tar.gz   # requires Windows 10 1803+ or 7-Zip
+cd child-001
+```
+2. Install Nebula manually — download `nebula-windows-amd64.zip` from [github.com/slackhq/nebula/releases](https://github.com/slackhq/nebula/releases) and extract `nebula.exe` to `C:\nebula\`
+3. Run the installer (PowerShell as Administrator):
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\install.ps1
+```
+
+`install.ps1` handles: uv, Python venv, Ollama, and optionally registers a Windows service via [NSSM](https://nssm.cc).
 
 > **The download token is one-time use and expires after 10 minutes.**
 > Regenerate it with `python3 manage.py token retoken child-001` if it expires.
 
 ### Start / stop the child agent
 
-**macOS:**
-```bash
-launchctl start com.mothership.child   # start
-launchctl stop  com.mothership.child   # stop
-```
-
-**Linux:**
-```bash
-sudo systemctl start mothership-child  # start
-sudo systemctl stop  mothership-child  # stop
-sudo systemctl status mothership-child # status
-```
-
-### View child logs
-
-**macOS:**
-```bash
-tail -f ~/mothership-child/child.log
-```
-
-**Linux:**
-```bash
-journalctl -fu mothership-child
-```
+| Platform | Start | Stop | Logs |
+|----------|-------|------|------|
+| **macOS** | `launchctl start com.mothership.child` | `launchctl stop com.mothership.child` | `tail -f ~/mothership-child/child.log` |
+| **Linux** | `sudo systemctl start mothership-child` | `sudo systemctl stop mothership-child` | `journalctl -fu mothership-child` |
+| **Windows** | `nssm start mothership-child` | `nssm stop mothership-child` | `Get-Content ~\mothership-child\server.log -Wait` |
 
 ### Local dev (same machine)
 
 ```bash
-python3 manage.py child start          # start child agent
+python3 manage.py child start          # start child agent (background, PID-tracked)
 python3 manage.py child stop           # stop it
 python3 manage.py child detect-model   # run whichllm without starting
 python3 manage.py child logs -n 100    # tail logs
@@ -165,7 +164,26 @@ Children connect outbound — no ports need to be open on child machines.
 
 ## manage.py — control CLI
 
-`manage.py` is a zero-dependency Python CLI that works on macOS, Linux, and Windows.
+`manage.py` is a zero-dependency Python script that works on macOS, Linux, and Windows. It is the single entry point for all operations.
+
+### Platform support
+
+| Command | macOS | Linux | Windows |
+|---------|-------|-------|---------|
+| `setup` | ✅ | ✅ | ✅ (uses PowerShell to install uv) |
+| `mother start/stop/status` | ✅ | ✅ | ✅ |
+| `child start/stop/logs/name/rename/remove` | ✅ | ✅ | ✅ |
+| `nebula setup` | ✅ | ✅ | requires WSL |
+| `token *` | ✅ | ✅ | requires WSL |
+
+> The **mother** should always run on macOS or Linux. Windows is fully supported as a **child** node.
+
+### First-time setup
+
+```bash
+python3 manage.py setup          # installs uv + creates venvs for mother and child
+python3 manage.py nebula setup   # generates keys, certs, and bundles
+```
 
 ```bash
 # Mother

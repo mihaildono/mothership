@@ -577,6 +577,94 @@ INSTALLEOF
 
     chmod +x "$BUNDLE_STAGING/install.sh"
 
+    # ── Generate install.ps1 (Windows / WSL-free child install) ──────────────
+    cat > "$BUNDLE_STAGING/install.ps1" << 'PS1EOF'
+# install.ps1 - Mothership child setup for Windows
+# Run in PowerShell (as Administrator for service registration):
+#   Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+#   .\install.ps1
+#
+# NOTE: Nebula on Windows requires its own binary from https://github.com/slackhq/nebula/releases
+#       Download nebula-windows-amd64.zip, extract, and place nebula.exe in C:\nebula\
+#
+param([switch]$SkipNebula)
+
+$ErrorActionPreference = "Stop"
+$BundleDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$AgentDir  = "$env:USERPROFILE\mothership-child"
+
+Write-Host "==> Mothership child setup (Windows)"
+
+# ── 1. Nebula (manual step on Windows) ───────────────────────────────────────
+if (-not $SkipNebula) {
+    $nebulaExe = "C:\nebula\nebula.exe"
+    if (-not (Test-Path $nebulaExe)) {
+        Write-Host ""
+        Write-Host "ACTION REQUIRED: Install Nebula for Windows"
+        Write-Host "  1. Download: https://github.com/slackhq/nebula/releases/latest"
+        Write-Host "     -> nebula-windows-amd64.zip"
+        Write-Host "  2. Extract nebula.exe to C:\nebula\"
+        Write-Host "  3. Re-run this script"
+        exit 1
+    }
+    $nebulaConf = "C:\nebula"
+    if (-not (Test-Path $nebulaConf)) { New-Item -ItemType Directory -Path $nebulaConf | Out-Null }
+    Copy-Item "$BundleDir\nebula\*" $nebulaConf -Force
+    Write-Host "  Nebula certs installed to $nebulaConf"
+}
+
+# ── 2. Install agent ──────────────────────────────────────────────────────────
+if (-not (Test-Path $AgentDir)) { New-Item -ItemType Directory -Path $AgentDir | Out-Null }
+Copy-Item "$BundleDir\agent\*" $AgentDir -Recurse -Force
+Write-Host "  Agent installed to $AgentDir"
+
+# ── 3. uv + venv ─────────────────────────────────────────────────────────────
+$uvExe = (Get-Command uv -ErrorAction SilentlyContinue)?.Source
+if (-not $uvExe) {
+    Write-Host "==> Installing uv..."
+    irm https://astral.sh/uv/install.ps1 | iex
+    $uvExe = "$env:LOCALAPPDATA\Programs\uv\uv.exe"
+}
+$venv = "$AgentDir\.venv"
+& $uvExe venv $venv --python 3.12 --seed
+& "$venv\Scripts\python.exe" -m pip install -r "$AgentDir\requirements.txt" -q
+Write-Host "  Python environment ready"
+
+# ── 4. Ollama ────────────────────────────────────────────────────────────────
+if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+    Write-Host "==> Installing Ollama..."
+    $ollamaInstaller = "$env:TEMP\OllamaSetup.exe"
+    Invoke-WebRequest "https://ollama.ai/download/OllamaSetup.exe" -OutFile $ollamaInstaller
+    Start-Process $ollamaInstaller -ArgumentList "/S" -Wait
+}
+
+# ── 5. Register as a Windows service (optional, requires NSSM) ───────────────
+$nssm = (Get-Command nssm -ErrorAction SilentlyContinue)?.Source
+if ($nssm) {
+    Write-Host "==> Registering mothership-child Windows service via NSSM..."
+    $python = "$venv\Scripts\python.exe"
+    & $nssm install mothership-child $python "$AgentDir\main.py"
+    & $nssm set mothership-child AppDirectory $AgentDir
+    & $nssm set mothership-child Start SERVICE_AUTO_START
+    & $nssm start mothership-child
+    Write-Host "  Service registered. Start/stop with:"
+    Write-Host "    nssm start mothership-child"
+    Write-Host "    nssm stop  mothership-child"
+} else {
+    Write-Host ""
+    Write-Host "  No service manager found (nssm). To run manually:"
+    Write-Host "    cd $AgentDir"
+    Write-Host "    .\.venv\Scripts\python.exe main.py"
+    Write-Host ""
+    Write-Host "  For service registration install nssm: https://nssm.cc"
+}
+
+Write-Host ""
+Write-Host "==========================================="
+Write-Host "  Child setup complete!"
+Write-Host "==========================================="
+PS1EOF
+
     # Pack the bundle
     BUNDLE_FILE="$BUNDLES_DIR/${child_id}.tar.gz"
     tar -czf "$BUNDLE_FILE" -C "$BUNDLES_DIR" "$child_id"

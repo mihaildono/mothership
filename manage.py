@@ -44,12 +44,45 @@ def _find_uv() -> str:
     uv = shutil.which("uv")
     if uv:
         return uv
-    local = Path.home() / ".local" / "bin" / ("uv.exe" if IS_WIN else "uv")
-    if local.exists():
-        return str(local)
-    print(
-        "ERROR: uv not found. Install: https://docs.astral.sh/uv/getting-started/installation/"
-    )
+    # Common install locations per platform
+    candidates = [
+        Path.home() / ".local" / "bin" / "uv",  # Linux/macOS (curl installer)
+        Path.home() / ".cargo" / "bin" / "uv",  # cargo install
+    ]
+    if IS_WIN:
+        local_app = Path(os.environ.get("LOCALAPPDATA", ""))
+        candidates += [
+            local_app / "Programs" / "uv" / "uv.exe",  # Windows installer default
+            Path.home() / ".local" / "bin" / "uv.exe",
+            Path.home() / ".cargo" / "bin" / "uv.exe",
+        ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    print("ERROR: uv not found.")
+    print("  Install: https://docs.astral.sh/uv/getting-started/installation/")
+    if IS_WIN:
+        print(
+            '  Windows: winget install --id=astral-sh.uv  OR  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"'
+        )
+    else:
+        print("  macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh")
+    sys.exit(1)
+
+
+def _bash_or_die(label: str) -> str:
+    """Return path to bash, or print a helpful error and exit on Windows."""
+    bash = shutil.which("bash")
+    if bash:
+        return bash
+    if IS_WIN:
+        print(f"ERROR: '{label}' requires bash.")
+        print(
+            "  On Windows, use WSL: https://learn.microsoft.com/en-us/windows/wsl/install"
+        )
+        print("  Then run this command inside the WSL terminal.")
+        sys.exit(1)
+    print(f"ERROR: bash not found (required for {label})")
     sys.exit(1)
 
 
@@ -123,27 +156,89 @@ def _save_names(names: dict[str, str]) -> None:
 # ── Mother commands ───────────────────────────────────────────────────────────
 
 
+_MOTHER_PID = MOTHER_DIR / ".mother.pid"
+_CHILD_PID = CHILD_DIR / ".child.pid"
+
+
+def _start_background(cmd: list[str], cwd: Path, env: dict, pid_file: Path) -> int:
+    """Start a process detached from the terminal and write its PID."""
+    import subprocess
+
+    if IS_WIN:
+        # CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            creationflags=0x00000008
+            | 0x00000200,  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            stdout=open(cwd / "server.log", "a"),
+            stderr=subprocess.STDOUT,
+        )
+    else:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=open(cwd / "server.log", "a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_file.write_text(str(proc.pid))
+    return proc.pid
+
+
+def _stop_by_pid(pid_file: Path, label: str) -> int:
+    """Kill the process recorded in pid_file."""
+    if not pid_file.exists():
+        print(f"{label} is not running (no PID file).")
+        return 0
+    try:
+        pid = int(pid_file.read_text().strip())
+        if IS_WIN:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            os.kill(pid, signal.SIGTERM)
+        pid_file.unlink(missing_ok=True)
+        print(f"{label} stopped (PID {pid}).")
+        return 0
+    except (ValueError, ProcessLookupError):
+        pid_file.unlink(missing_ok=True)
+        print(f"{label} was not running (stale PID file removed).")
+        return 0
+    except Exception as e:
+        print(f"ERROR stopping {label}: {e}")
+        return 1
+
+
 def mother_start(args: argparse.Namespace) -> int:
     _ensure_venv(MOTHER_DIR)
     python = _venv_python(MOTHER_DIR)
-    env = _load_mother_env()
+    env = {**os.environ, **_load_mother_env()}
     if not env.get("MOTHER_API_KEY"):
         print("ERROR: mother/.env not found or MOTHER_API_KEY not set.")
-        print("       Run: python manage.py nebula setup")
+        print("       Run: python3 manage.py nebula setup")
         return 1
-    print("==> Starting mother on port 8765...")
-    return _run([python, "main.py"], cwd=MOTHER_DIR, env=env)
+    if _MOTHER_PID.exists():
+        print(
+            "Mother appears already running (PID file exists). Run 'mother stop' first."
+        )
+        return 1
+    pid = _start_background(
+        [python, "main.py"], cwd=MOTHER_DIR, env=env, pid_file=_MOTHER_PID
+    )
+    print(f"==> Mother started (PID {pid}) on port 8765.")
+    print(f"    Logs: {MOTHER_DIR / 'server.log'}")
+    return 0
 
 
 def mother_stop(args: argparse.Namespace) -> int:
-    if IS_MAC:
-        subprocess.run(["pkill", "-f", "mother/main.py"], cwd=ROOT)
-    elif IS_LINUX:
-        subprocess.run(["pkill", "-f", "mother/main.py"], cwd=ROOT)
-    elif IS_WIN:
-        subprocess.run(["taskkill", "/F", "/FI", "WINDOWTITLE eq mother*"], shell=True)
-    print("Mother stopped.")
-    return 0
+    return _stop_by_pid(_MOTHER_PID, "Mother")
 
 
 def mother_status(args: argparse.Namespace) -> int:
@@ -185,19 +280,21 @@ def child_start(args: argparse.Namespace) -> int:
         print("ERROR: child/config.toml not found.")
         print("       For local dev, copy from a bundle or create manually.")
         return 1
-    print("==> Starting child agent...")
-    return _run([python, "main.py"], cwd=CHILD_DIR)
+    if _CHILD_PID.exists():
+        print(
+            "Child appears already running (PID file exists). Run 'child stop' first."
+        )
+        return 1
+    pid = _start_background(
+        [python, "main.py"], cwd=CHILD_DIR, env=dict(os.environ), pid_file=_CHILD_PID
+    )
+    print(f"==> Child started (PID {pid}).")
+    print(f"    Logs: {CHILD_DIR / 'server.log'}")
+    return 0
 
 
 def child_stop(args: argparse.Namespace) -> int:
-    if IS_MAC:
-        subprocess.run(["pkill", "-f", "child/main.py"], cwd=ROOT)
-    elif IS_LINUX:
-        subprocess.run(["pkill", "-f", "child/main.py"], cwd=ROOT)
-    elif IS_WIN:
-        subprocess.run(["taskkill", "/F", "/FI", "WINDOWTITLE eq child*"], shell=True)
-    print("Child stopped.")
-    return 0
+    return _stop_by_pid(_CHILD_PID, "Child")
 
 
 def child_logs(args: argparse.Namespace) -> int:
@@ -295,14 +392,7 @@ def child_remove(args: argparse.Namespace) -> int:
         print(f"Removed name entry: '{removed_name}'")
 
     # 3. Revoke token + bundle (child will be rejected on next reconnect)
-    script = NEBULA_DIR / "manage-child.sh"
-    if script.exists() and not IS_WIN:
-        rc = _run(["bash", str(script), "revoke", args.child_id], cwd=ROOT)
-    else:
-        print(
-            "NOTE: Token revocation requires bash. Manually remove the child's lines from mother/.env."
-        )
-        rc = 0
+    rc = _manage_child_sh("revoke", args.child_id)
 
     print(
         f"Child '{args.child_id}' removed. Token revoked — reconnection will be rejected."
@@ -313,16 +403,80 @@ def child_remove(args: argparse.Namespace) -> int:
 # ── Nebula / setup commands ───────────────────────────────────────────────────
 
 
+def do_setup(args: argparse.Namespace) -> int:
+    """Install uv and create venvs for mother and child."""
+    # Install uv if missing
+    if not shutil.which("uv"):
+        print("==> Installing uv...")
+        if IS_WIN:
+            rc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "irm https://astral.sh/uv/install.ps1 | iex",
+                ],
+                shell=False,
+            ).returncode
+        else:
+            rc = subprocess.run(
+                "curl -LsSf https://astral.sh/uv/install.sh | sh",
+                shell=True,
+            ).returncode
+        if rc != 0:
+            print(
+                "ERROR: uv installation failed. Install manually: https://docs.astral.sh/uv/"
+            )
+            return rc
+        # Re-scan PATH after install
+        path_additions = [
+            str(Path.home() / ".local" / "bin"),
+            str(Path.home() / ".cargo" / "bin"),
+        ]
+        os.environ["PATH"] = (
+            os.pathsep.join(path_additions) + os.pathsep + os.environ.get("PATH", "")
+        )
+
+    uv = _find_uv()
+    print(f"==> uv found: {uv}")
+
+    for label, d in (("mother", MOTHER_DIR), ("child", CHILD_DIR)):
+        venv = d / ".venv"
+        if venv.exists():
+            print(f"    {label}/.venv already exists — skipping")
+            continue
+        print(f"==> Creating {label}/.venv (Python 3.12)...")
+        subprocess.run(
+            [uv, "venv", str(venv), "--python", "3.12", "--seed"], check=True
+        )
+        python = _venv_python(d)
+        req = d / "requirements.txt"
+        if req.exists():
+            print(f"==> Installing {label} dependencies...")
+            subprocess.run(
+                [python, "-m", "pip", "install", "-r", str(req), "-q"], check=True
+            )
+
+    print("\nSetup complete.")
+    if not IS_WIN:
+        print(
+            "Next: run  python3 manage.py nebula setup  to generate keys and bundles."
+        )
+    else:
+        print(
+            "Next: run nebula/setup-mother.sh inside WSL to generate keys and bundles."
+        )
+    return 0
+
+
 def nebula_setup(args: argparse.Namespace) -> int:
+    bash = _bash_or_die("nebula setup")
     script = NEBULA_DIR / "setup-mother.sh"
     if not script.exists():
         print(f"ERROR: {script} not found")
         return 1
-    if IS_WIN:
-        print("ERROR: Nebula setup requires bash. Use WSL on Windows.")
-        return 1
     print("==> Running nebula/setup-mother.sh...")
-    return _run(["bash", str(script)], cwd=ROOT)
+    return _run([bash, str(script)], cwd=ROOT)
 
 
 # ── Bundle commands ───────────────────────────────────────────────────────────
@@ -350,27 +504,32 @@ def bundle_list(args: argparse.Namespace) -> int:
 # ── Token commands ────────────────────────────────────────────────────────────
 
 
-def token_list(args: argparse.Namespace) -> int:
+def _manage_child_sh(subcmd: str, child_id: str | None = None) -> int:
+    bash = _bash_or_die(f"token {subcmd}")
     script = NEBULA_DIR / "manage-child.sh"
     if not script.exists():
         print("ERROR: nebula/manage-child.sh not found")
         return 1
-    return _run(["bash", str(script), "list"], cwd=ROOT)
+    cmd = [bash, str(script), subcmd]
+    if child_id:
+        cmd.append(child_id)
+    return _run(cmd, cwd=ROOT)
+
+
+def token_list(args: argparse.Namespace) -> int:
+    return _manage_child_sh("list")
 
 
 def token_add(args: argparse.Namespace) -> int:
-    script = NEBULA_DIR / "manage-child.sh"
-    return _run(["bash", str(script), "add", args.child_id], cwd=ROOT)
+    return _manage_child_sh("add", args.child_id)
 
 
 def token_revoke(args: argparse.Namespace) -> int:
-    script = NEBULA_DIR / "manage-child.sh"
-    return _run(["bash", str(script), "revoke", args.child_id], cwd=ROOT)
+    return _manage_child_sh("revoke", args.child_id)
 
 
 def token_retoken(args: argparse.Namespace) -> int:
-    script = NEBULA_DIR / "manage-child.sh"
-    return _run(["bash", str(script), "retoken", args.child_id], cwd=ROOT)
+    return _manage_child_sh("retoken", args.child_id)
 
 
 # ── Send / test commands ──────────────────────────────────────────────────────
@@ -456,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Mothership — cross-platform control CLI",
     )
     sub = parser.add_subparsers(dest="component", required=True)
+
+    # setup (top-level, no subcommand needed)
+    sub.add_parser(
+        "setup", help="Install uv + create venvs for mother and child"
+    ).set_defaults(func=do_setup)
 
     # mother
     m = sub.add_parser("mother", help="Manage the mother orchestrator")
