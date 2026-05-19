@@ -14,18 +14,24 @@ import httpx
 
 _process: subprocess.Popen | None = None
 
+
 # Resolve ollama binary at import time — covers Homebrew (Intel + Apple Silicon),
 # system installs, and anything on PATH.
 def _find_ollama() -> str:
     found = shutil.which("ollama")
     if found:
         return found
-    for candidate in ("/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "/usr/bin/ollama"):
+    for candidate in (
+        "/opt/homebrew/bin/ollama",
+        "/usr/local/bin/ollama",
+        "/usr/bin/ollama",
+    ):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     raise FileNotFoundError(
         "ollama binary not found. Install it from https://ollama.ai or brew install ollama"
     )
+
 
 _OLLAMA_BIN = _find_ollama()
 
@@ -54,6 +60,40 @@ async def stop() -> None:
         except subprocess.TimeoutExpired:
             _process.kill()
     _process = None
+
+
+async def is_model_available(model: str, host: str = "http://localhost:11434") -> bool:
+    """Return True if the model is already pulled in the local Ollama instance."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{host}/api/tags")
+            r.raise_for_status()
+            names = [m["name"] for m in r.json().get("models", [])]
+            base = model.split(":")[0].lower()
+            return any(base in n.lower() for n in names)
+    except Exception:
+        return False
+
+
+async def ensure_model(model: str, host: str = "http://localhost:11434") -> None:
+    """Pull the model if it is not already available locally."""
+    if await is_model_available(model, host):
+        return
+    import logging
+
+    logger = logging.getLogger("ollama_runner")
+    logger.info("Pulling model '%s' — this may take a while...", model)
+    proc = await asyncio.create_subprocess_exec(
+        _OLLAMA_BIN,
+        "pull",
+        model,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Failed to pull model '{model}': {stdout.decode()[:500]}")
+    logger.info("Model '%s' pulled successfully.", model)
 
 
 async def run_inference(prompt: str, model: str, host: str) -> str:

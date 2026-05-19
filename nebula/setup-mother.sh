@@ -172,8 +172,8 @@ for child_id in "${CHILD_LIST[@]}"; do
     child_ip="${BASE_CHILD_IP}.${CHILD_INDEX}"
 
     # ── Generate / load per-child auth token ──────────────────────────────────
-    if grep -q "# child:${child_id}:" "$MOTHER_ENV" 2>/dev/null; then
-        CHILD_AUTH_TOKEN="$(grep "# child:${child_id}:" "$MOTHER_ENV" | sed 's/.*=//')"
+    if grep -q "# child:${child_id}:token=" "$MOTHER_ENV" 2>/dev/null; then
+        CHILD_AUTH_TOKEN="$(grep "^# child:${child_id}:token=" "$MOTHER_ENV" | sed 's/^.*token=//')"
         echo "==> Existing auth token for ${child_id} loaded."
     else
         CHILD_AUTH_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -284,7 +284,7 @@ host    = "${MOTHER_IP}"
 ws_port = 8765
 
 [ollama]
-model = "gemma4:e2b"
+model = "gemma3:4b"
 host  = "http://localhost:11434"
 TOMLEOF
     chmod 600 "$BUNDLE_STAGING/agent/config.toml"
@@ -381,8 +381,92 @@ uv venv "$VENV" --python 3.12 --seed
 "$VENV/bin/python3" -m pip install --upgrade pip --quiet
 "$VENV/bin/python3" -m pip install -r "$AGENT_DIR/requirements.txt" --quiet
 
-# Pull the model
-MODEL="$(python3 -c "
+# Auto-detect best model for this hardware using whichllm, then pull it.
+# Falls back to the model already written in config.toml if detection fails.
+echo "==> Detecting best model for this hardware..."
+# Capture whichllm output to a temp file to avoid pipe+heredoc stdin conflict.
+_WL_TMP="$(mktemp)"
+"$VENV/bin/whichllm" --json --top 5 > "$_WL_TMP" 2>/dev/null || true
+
+DETECTED_MODEL=""
+if [[ -s "$_WL_TMP" ]]; then
+    DETECTED_MODEL="$("$VENV/bin/python3" << PYEOF
+import json, re, pathlib, sys
+
+FAMILY_MAP = [
+    (r"qwen3\.6",     "qwen3.6"),
+    (r"qwen3",        "qwen3"),
+    (r"qwen2\.5",     "qwen2.5"),
+    (r"qwen2",        "qwen2"),
+    (r"qwen",         "qwen"),
+    (r"llama-?4",     "llama4"),
+    (r"llama-?3\.3",  "llama3.3"),
+    (r"llama-?3\.2",  "llama3.2"),
+    (r"llama-?3\.1",  "llama3.1"),
+    (r"llama-?3",     "llama3"),
+    (r"llama-?2",     "llama2"),
+    (r"mistral-nemo", "mistral-nemo"),
+    (r"mistral",      "mistral"),
+    (r"mixtral",      "mixtral"),
+    (r"phi-?4",       "phi4"),
+    (r"phi-?3\.5",    "phi3.5"),
+    (r"phi-?3",       "phi3"),
+    (r"gemma-?3",     "gemma3"),
+    (r"gemma-?2",     "gemma2"),
+    (r"gemma",        "gemma"),
+    (r"deepseek-r2",  "deepseek-r2"),
+    (r"deepseek-r1",  "deepseek-r1"),
+    (r"deepseek-v3",  "deepseek-v3"),
+    (r"deepseek-v2",  "deepseek-v2"),
+    (r"deepseek",     "deepseek"),
+    (r"command-?r",   "command-r"),
+]
+
+def param_tag(s):
+    m = re.search(r"(\d+\.?\d*)[xX](\d+)[bB]", s)
+    if m: return f"{m.group(1)}x{m.group(2)}b"
+    m = re.search(r"(\d+\.?\d*)[bB]", s)
+    return f"{m.group(1)}b" if m else None
+
+def hf_to_ollama(model_id):
+    s = model_id.lower()
+    if "/" in s: s = s.split("/", 1)[1]
+    for suf in ("-instruct","-chat","-hf","-gguf","-awq","-gptq","-bf16","-fp16","-it","-base"):
+        s = s.replace(suf, "")
+    tag = param_tag(s)
+    for pat, base in FAMILY_MAP:
+        if re.search(pat, s):
+            return f"{base}:{tag}" if tag else base
+    return None
+
+try:
+    data = json.loads(pathlib.Path("$_WL_TMP").read_text())
+    for m in data.get("models", []):
+        name = hf_to_ollama(m.get("model_id", ""))
+        if name:
+            print(name)
+            sys.exit(0)
+except Exception:
+    pass
+PYEOF
+    )"
+fi
+rm -f "$_WL_TMP"
+
+if [[ -n "$DETECTED_MODEL" ]]; then
+    echo "==> Best model for this hardware: $DETECTED_MODEL"
+    # Update config.toml with the detected model
+    "$VENV/bin/python3" -c "
+import re, pathlib
+p = pathlib.Path('$AGENT_DIR/config.toml')
+text = p.read_text()
+new = re.sub(r'(?m)(^\s*model\s*=\s*)\"[^\"]*\"', r'\g<1>\"$DETECTED_MODEL\"', text)
+p.write_text(new)
+"
+    MODEL="$DETECTED_MODEL"
+else
+    # Fall back to the model in config.toml (written during bundle creation)
+    MODEL="$("$VENV/bin/python3" -c "
 import sys
 try:
     import tomllib
@@ -390,10 +474,13 @@ except ImportError:
     import tomli as tomllib
 with open('$AGENT_DIR/config.toml', 'rb') as f:
     cfg = tomllib.load(f)
-print(cfg.get('ollama', {}).get('model', 'gemma4:e2b'))
+print(cfg.get('ollama', {}).get('model', 'gemma3:4b'))
 ")"
+    echo "==> whichllm detection skipped — using model: $MODEL"
+fi
+
 echo "==> Pulling model: $MODEL (this may take a while)..."
-ollama pull "$MODEL" || echo "  Warning: model pull failed — try manually: ollama pull $MODEL"
+ollama pull "$MODEL" || echo "  Warning: model pull failed — you can retry: ollama pull $MODEL"
 
 # ── 4. Install as a service ───────────────────────────────────────────────────
 echo "==> Installing services..."

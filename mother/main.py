@@ -28,7 +28,15 @@ from pathlib import Path
 
 import uvicorn
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Security, Depends
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    Query,
+    Security,
+    Depends,
+)
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, field_validator
@@ -54,7 +62,9 @@ _MOTHER_API_KEY = os.environ.get("MOTHER_API_KEY", "")
 
 def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
     if not _MOTHER_API_KEY:
-        raise HTTPException(status_code=500, detail="Server misconfigured: MOTHER_API_KEY not set")
+        raise HTTPException(
+            status_code=500, detail="Server misconfigured: MOTHER_API_KEY not set"
+        )
     if not key or not secrets.compare_digest(key, _MOTHER_API_KEY):
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
@@ -73,6 +83,7 @@ def _load_child_tokens() -> dict[str, str]:
             cid, tok = pair.split("=", 1)
             result[cid.strip()] = tok.strip()
     return result
+
 
 _CHILD_TOKENS: dict[str, str] = _load_child_tokens()
 
@@ -131,7 +142,7 @@ async def ws_child(ws: WebSocket):
                 await ws.close(code=4003, reason="Invalid auth_token")
                 return
 
-        await registry.register(child_id, ws)
+        await registry.register(child_id, ws, model=msg.get("model", "unknown"))
 
         # Message loop
         async for raw in ws.iter_text():
@@ -202,7 +213,9 @@ class SendRequest(BaseModel):
     @classmethod
     def prompt_length(cls, v: str) -> str:
         if len(v) > _MAX_PROMPT_LEN:
-            raise ValueError(f"Prompt exceeds maximum length of {_MAX_PROMPT_LEN} characters")
+            raise ValueError(
+                f"Prompt exceeds maximum length of {_MAX_PROMPT_LEN} characters"
+            )
         return v
 
     @field_validator("child_id", "task_id")
@@ -261,10 +274,13 @@ async def get_bundle(child_id: str, token: str = Query(...)) -> FileResponse:
         raise HTTPException(status_code=404, detail=f"No bundle found for '{child_id}'")
 
     if not token_file.exists():
-        raise HTTPException(status_code=403, detail="Bundle token not configured or already used")
+        raise HTTPException(
+            status_code=403, detail="Bundle token not configured or already used"
+        )
 
     try:
         import json as _json
+
         token_data = _json.loads(token_file.read_text())
         expected = token_data["token"]
         expires_at = float(token_data["expires_at"])

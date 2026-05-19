@@ -1,0 +1,13 @@
+child_id   = "child-001"
+auth_token = "# child:child-001: auth token — delete this line to revoke
+8ec9430d85ff2309e8ed26cbce5ae16892a463c71fa5aa10918b4ed255927ce6"
+work_start = "00:00"
+work_end   = "23:59"
+
+[mother]
+host    = "10.10.0.1"
+ws_port = 8765
+
+[ollama]
+model = "gemma3:4b"
+host  = "http://localhost:11434"

@@ -38,13 +38,14 @@ async def run(cfg: ChildConfig, on_status: StatusCallback) -> None:
                 logger.info("Connected to mother at %s", cfg.mother.ws_url)
                 backoff = _INITIAL_BACKOFF  # reset on successful connect
 
-                # Register this child
+                # Register this child, reporting the model it will run
                 await ws.send(
                     json.dumps(
                         {
                             "type": "CHILD_REGISTER",
                             "child_id": cfg.child_id,
                             "auth_token": cfg.auth_token,
+                            "model": cfg.ollama.model,
                         }
                     )
                 )

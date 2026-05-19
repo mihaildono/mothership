@@ -23,6 +23,7 @@ class ChildEntry:
     child_id: str
     ws: "WebSocketServerProtocol"
     status: str = "idle"  # idle | busy | offline
+    model: str = "unknown"  # Ollama model reported at registration
     connected_at: datetime = field(default_factory=datetime.utcnow)
     last_seen: datetime = field(default_factory=datetime.utcnow)
     last_ping_ms: float | None = None  # round-trip latency of last health check
@@ -33,9 +34,11 @@ class ChildRegistry:
         self._children: dict[str, ChildEntry] = {}
         self._lock = asyncio.Lock()
 
-    async def register(self, child_id: str, ws: "WebSocketServerProtocol") -> None:
+    async def register(
+        self, child_id: str, ws: "WebSocketServerProtocol", model: str = "unknown"
+    ) -> None:
         async with self._lock:
-            self._children[child_id] = ChildEntry(child_id=child_id, ws=ws)
+            self._children[child_id] = ChildEntry(child_id=child_id, ws=ws, model=model)
         logger.info(
             "Child registered: %s  (total active: %d)", child_id, len(self._children)
         )
@@ -65,6 +68,7 @@ class ChildRegistry:
             {
                 "child_id": e.child_id,
                 "status": e.status,
+                "model": e.model,
                 "connected_at": e.connected_at.isoformat(),
                 "last_seen": e.last_seen.isoformat(),
                 "last_ping_ms": e.last_ping_ms,

@@ -59,3 +59,31 @@ def load(path: Path | None = None) -> ChildConfig:
             host=raw["ollama"]["host"],
         ),
     )
+
+
+def update_model(model_name: str, path: Path | None = None) -> None:
+    """
+    Persist a new Ollama model name into config.toml.
+    Rewrites only the model line under [ollama] so other values are preserved.
+    """
+    config_path = path or Path(__file__).parent / "config.toml"
+    text = config_path.read_text(encoding="utf-8")
+
+    import re
+
+    # Replace the model = "..." line inside the [ollama] section
+    new_text = re.sub(
+        r'(?m)(^\s*model\s*=\s*)"[^"]*"',
+        lambda m: f'{m.group(1)}"{model_name}"',
+        text,
+    )
+
+    if new_text == text:
+        # model key not present yet — append under [ollama]
+        new_text = re.sub(
+            r"(\[ollama\])",
+            f'\\1\nmodel = "{model_name}"',
+            new_text,
+        )
+
+    config_path.write_text(new_text, encoding="utf-8")

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config as cfg_loader
+import model_detector
 import ollama_runner
 import ws_client
 
@@ -39,8 +40,34 @@ async def lifespan(app: FastAPI):
     global _ws_task
     cfg = cfg_loader.load()
     app.state.cfg = cfg
+
+    # Auto-detect best model for this hardware if the configured model
+    # is not yet pulled locally (first run or placeholder value).
+    detected = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: model_detector.detect(ollama_bin=ollama_runner._OLLAMA_BIN)
+    )
+    if detected:
+        if not await ollama_runner.is_model_available(cfg.ollama.model):
+            logger.info(
+                "Configured model '%s' not found locally — using detected model '%s'",
+                cfg.ollama.model,
+                detected.ollama_name,
+            )
+            cfg_loader.update_model(detected.ollama_name)
+            cfg = cfg_loader.load()
+            app.state.cfg = cfg
+        else:
+            logger.info(
+                "Configured model '%s' is available. "
+                "(Best for this hardware: %s, score %.1f)",
+                cfg.ollama.model,
+                detected.ollama_name,
+                detected.score,
+            )
+
     logger.info("Child '%s' starting — launching Ollama...", cfg.child_id)
     await ollama_runner.start()
+    await ollama_runner.ensure_model(cfg.ollama.model)
     logger.info("Ollama ready. Connecting to mother at %s...", cfg.mother.ws_url)
     _ws_task = asyncio.create_task(ws_client.run(cfg, _on_status))
     yield
