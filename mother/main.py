@@ -70,22 +70,29 @@ def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
 
 
 # ── Auth token registry for children ─────────────────────────────────────────
-# Maps child_id → expected auth_token (hex string).
-# Loaded from MOTHER_CHILD_TOKENS env var: "child-001=token1,child-002=token2"
-def _load_child_tokens() -> dict[str, str]:
-    raw = os.environ.get("MOTHER_CHILD_TOKENS", "")
-    if not raw:
-        return {}
-    result: dict[str, str] = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if "=" in pair:
-            cid, tok = pair.split("=", 1)
-            result[cid.strip()] = tok.strip()
-    return result
+# Read from .env on disk each time so revocations take effect without a restart.
+_ENV_FILE = Path(__file__).parent / ".env"
 
 
-_CHILD_TOKENS: dict[str, str] = _load_child_tokens()
+def _get_child_token(child_id: str) -> str | None:
+    """Return the expected auth token for a child, read fresh from .env each call."""
+    try:
+        for line in _ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == "MOTHER_CHILD_TOKENS":
+                for pair in v.split(","):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        cid, tok = pair.split("=", 1)
+                        if cid.strip() == child_id:
+                            return tok.strip()
+    except Exception:
+        pass
+    return None
+
 
 # ── Display name registry ─────────────────────────────────────────────────────
 _NAMES_FILE = Path(__file__).parent / "child-names.json"
@@ -108,8 +115,6 @@ async def lifespan(app: FastAPI):
     app.state.results = {}
     if not _MOTHER_API_KEY:
         raise RuntimeError("MOTHER_API_KEY env var is required but not set")
-    if not _CHILD_TOKENS:
-        logger.warning("MOTHER_CHILD_TOKENS not set — no children can register!")
     logger.info("Mother starting up...")
     health_task = asyncio.create_task(health_module.run(registry))
     yield
@@ -148,11 +153,17 @@ async def ws_child(ws: WebSocket):
             await ws.close(code=4001, reason="Invalid child_id")
             return
 
-        # Validate auth_token if we have a registry
-        if _CHILD_TOKENS:
+        # Validate auth_token — re-read .env each time so revocations apply immediately
+        if _ENV_FILE.exists():
             supplied = msg.get("auth_token", "")
-            expected = _CHILD_TOKENS.get(child_id, "")
-            if not expected or not secrets.compare_digest(supplied, expected):
+            expected = _get_child_token(child_id)
+            if not expected:
+                logger.warning(
+                    "No token configured for child '%s' — rejecting", child_id
+                )
+                await ws.close(code=4003, reason="Child not authorised")
+                return
+            if not secrets.compare_digest(supplied, expected):
                 logger.warning("Auth failed for child '%s' — rejecting", child_id)
                 await ws.close(code=4003, reason="Invalid auth_token")
                 return
@@ -219,6 +230,23 @@ async def _handle_message(child_id: str, msg: dict) -> None:
 @app.get("/children", dependencies=[Depends(_require_api_key)])
 async def list_children() -> JSONResponse:
     return JSONResponse(registry.snapshot())
+
+
+@app.delete("/children/{child_id}", dependencies=[Depends(_require_api_key)])
+async def kick_child(child_id: str) -> JSONResponse:
+    """Forcefully disconnect a child. Safe to call while the child is running."""
+    if not child_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid child_id")
+    entry = registry.get(child_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Child '{child_id}' not connected")
+    try:
+        await entry.ws.close(code=4003, reason="Removed by operator")
+    except Exception:
+        pass
+    await registry.remove(child_id)
+    logger.info("Child '%s' kicked by operator", child_id)
+    return JSONResponse({"kicked": True, "child_id": child_id})
 
 
 _MAX_PROMPT_LEN = 10_000  # characters

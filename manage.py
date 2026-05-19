@@ -261,15 +261,40 @@ def child_name(args: argparse.Namespace) -> int:
 
 
 def child_remove(args: argparse.Namespace) -> int:
-    """Remove a child: revoke its token and delete its name."""
-    # Remove from names file
+    """Remove a child: kick active connection, revoke token, delete name."""
+    # 1. Kick the active WS connection if mother is running
+    env = _load_mother_env()
+    api_key = env.get("MOTHER_API_KEY", "")
+    if api_key:
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(
+            f"http://localhost:8765/children/{args.child_id}",
+            headers={"X-API-Key": api_key},
+            method="DELETE",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=3)
+            print(f"Child '{args.child_id}' disconnected from mother.")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"Child '{args.child_id}' was not connected (already offline).")
+            else:
+                print(f"Warning: kick returned {e.code} — proceeding anyway.")
+        except urllib.error.URLError:
+            print(
+                "Warning: mother not reachable — token will be revoked but child may stay connected until it reconnects."
+            )
+
+    # 2. Remove from names file
     names = _load_names()
     removed_name = names.pop(args.child_id, None)
     if removed_name:
         _save_names(names)
         print(f"Removed name entry: '{removed_name}'")
 
-    # Revoke token + bundle
+    # 3. Revoke token + bundle (child will be rejected on next reconnect)
     script = NEBULA_DIR / "manage-child.sh"
     if script.exists() and not IS_WIN:
         rc = _run(["bash", str(script), "revoke", args.child_id], cwd=ROOT)
@@ -279,7 +304,9 @@ def child_remove(args: argparse.Namespace) -> int:
         )
         rc = 0
 
-    print(f"Child '{args.child_id}' removed. Restart the mother to apply.")
+    print(
+        f"Child '{args.child_id}' removed. Token revoked — reconnection will be rejected."
+    )
     return rc
 
 
