@@ -289,11 +289,11 @@ host  = "http://localhost:11434"
 TOMLEOF
     chmod 600 "$BUNDLE_STAGING/agent/config.toml"
 
-    # ── Generate install.sh ───────────────────────────────────────────────────
+    # ── Generate install.sh (macOS + Linux) ──────────────────────────────────
     cat > "$BUNDLE_STAGING/install.sh" << 'INSTALLEOF'
 #!/usr/bin/env bash
-# install.sh — One-command Mothership child setup.
-# Installs Nebula, sets up the agent, and registers both as boot services.
+# install.sh — Mothership child setup for macOS and Linux.
+# For Windows use install.ps1 instead.
 set -euo pipefail
 
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -303,74 +303,63 @@ AGENT_DIR="$HOME/mothership-child"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
-echo "==> Mothership child setup"
+[[ "$OS" == "darwin" || "$OS" == "linux" ]] || { echo "Use install.ps1 on Windows."; exit 1; }
+
+echo "==> Mothership child setup ($OS)"
 echo ""
 
 # ── 1. Install Nebula ─────────────────────────────────────────────────────────
 BUNDLED_BINARY="$BUNDLE_DIR/nebula/nebula"
-NEED_DOWNLOAD=false
 if [[ -x "$BUNDLED_BINARY" ]] && "$BUNDLED_BINARY" --version &>/dev/null 2>&1; then
     INSTALL_SOURCE="$BUNDLED_BINARY"
 else
     echo "  Bundled binary not compatible — downloading correct version..."
-    NEED_DOWNLOAD=true
-fi
-
-if [[ "$NEED_DOWNLOAD" == true ]]; then
     NEBULA_VERSION="$(curl -fsSL --max-time 10 https://api.github.com/repos/slackhq/nebula/releases/latest \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo 'v1.10.3')"
     TMP_DIR="$(mktemp -d)"
-    case "$OS" in
-        darwin)
-            curl -fsSL "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/nebula-darwin.zip" \
-                -o "$TMP_DIR/nebula.zip"
-            unzip -q "$TMP_DIR/nebula.zip" -d "$TMP_DIR"
-            ;;
-        linux)
-            case "$ARCH" in
-                x86_64|amd64)  ASSET="nebula-linux-amd64.tar.gz"  ;;
-                arm64|aarch64) ASSET="nebula-linux-arm64.tar.gz"  ;;
-                *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
-            esac
-            curl -fsSL "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/${ASSET}" \
-                | tar -xz -C "$TMP_DIR"
-            ;;
-        *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
-    esac
+    if [[ "$OS" == "darwin" ]]; then
+        curl -fsSL "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/nebula-darwin.zip" \
+            -o "$TMP_DIR/nebula.zip"
+        unzip -q "$TMP_DIR/nebula.zip" -d "$TMP_DIR"
+    else
+        case "$ARCH" in
+            x86_64|amd64)  ASSET="nebula-linux-amd64.tar.gz"  ;;
+            arm64|aarch64) ASSET="nebula-linux-arm64.tar.gz"  ;;
+            *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+        esac
+        curl -fsSL "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/${ASSET}" \
+            | tar -xz -C "$TMP_DIR"
+    fi
     INSTALL_SOURCE="$TMP_DIR/nebula"
 fi
 
-echo "==> Installing Nebula..."
+echo "==> Installing Nebula binary..."
 sudo install -m 755 "$INSTALL_SOURCE" "$NEBULA_BIN"
 sudo mkdir -p "$NEBULA_ETC"
-sudo install -m 644 "$BUNDLE_DIR/nebula/ca.crt"       "$NEBULA_ETC/ca.crt"
-sudo install -m 600 "$BUNDLE_DIR/nebula/node.crt"     "$NEBULA_ETC/node.crt"
-sudo install -m 600 "$BUNDLE_DIR/nebula/node.key"     "$NEBULA_ETC/node.key"
-sudo install -m 644 "$BUNDLE_DIR/nebula/config.yml"   "$NEBULA_ETC/config.yml"
+sudo install -m 644 "$BUNDLE_DIR/nebula/ca.crt"     "$NEBULA_ETC/ca.crt"
+sudo install -m 600 "$BUNDLE_DIR/nebula/node.crt"   "$NEBULA_ETC/node.crt"
+sudo install -m 600 "$BUNDLE_DIR/nebula/node.key"   "$NEBULA_ETC/node.key"
+sudo install -m 644 "$BUNDLE_DIR/nebula/config.yml" "$NEBULA_ETC/config.yml"
 
 # ── 2. Install agent ──────────────────────────────────────────────────────────
 echo "==> Installing child agent to $AGENT_DIR..."
 mkdir -p "$AGENT_DIR"
 cp -r "$BUNDLE_DIR/agent/." "$AGENT_DIR/"
 
-# ── 3. Install uv + venv + deps ───────────────────────────────────────────────
+# ── 3. uv + Ollama + venv + deps ─────────────────────────────────────────────
 echo "==> Setting up Python environment..."
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source "$HOME/.local/bin/env"
+    source "$HOME/.local/bin/env" 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Install Ollama if missing
 if ! command -v ollama &>/dev/null; then
     echo "==> Installing Ollama..."
     if [[ "$OS" == "darwin" ]]; then
-        if command -v brew &>/dev/null; then
-            brew install ollama
-        else
-            echo "  Install Homebrew first: https://brew.sh" >&2
-            exit 1
-        fi
+        command -v brew &>/dev/null || { echo "Install Homebrew first: https://brew.sh" >&2; exit 1; }
+        brew install ollama
     else
         curl -fsSL https://ollama.ai/install.sh | sh
     fi
@@ -381,10 +370,8 @@ uv venv "$VENV" --python 3.12 --seed
 "$VENV/bin/python3" -m pip install --upgrade pip --quiet
 "$VENV/bin/python3" -m pip install -r "$AGENT_DIR/requirements.txt" --quiet
 
-# Auto-detect best model for this hardware using whichllm, then pull it.
-# Falls back to the model already written in config.toml if detection fails.
+# ── 4. Auto-detect and pull model ────────────────────────────────────────────
 echo "==> Detecting best model for this hardware..."
-# Capture whichllm output to a temp file to avoid pipe+heredoc stdin conflict.
 _WL_TMP="$(mktemp)"
 "$VENV/bin/whichllm" --json --top 5 > "$_WL_TMP" 2>/dev/null || true
 
@@ -455,7 +442,6 @@ rm -f "$_WL_TMP"
 
 if [[ -n "$DETECTED_MODEL" ]]; then
     echo "==> Best model for this hardware: $DETECTED_MODEL"
-    # Update config.toml with the detected model
     "$VENV/bin/python3" -c "
 import re, pathlib
 p = pathlib.Path('$AGENT_DIR/config.toml')
@@ -465,7 +451,6 @@ p.write_text(new)
 "
     MODEL="$DETECTED_MODEL"
 else
-    # Fall back to the model in config.toml (written during bundle creation)
     MODEL="$("$VENV/bin/python3" -c "
 import sys
 try:
@@ -480,14 +465,14 @@ print(cfg.get('ollama', {}).get('model', 'gemma3:4b'))
 fi
 
 echo "==> Pulling model: $MODEL (this may take a while)..."
-ollama pull "$MODEL" || echo "  Warning: model pull failed — you can retry: ollama pull $MODEL"
+ollama pull "$MODEL" || echo "  Warning: model pull failed — retry with: ollama pull $MODEL"
 
-# ── 4. Install as a service ───────────────────────────────────────────────────
+# ── 5. Register as boot service ───────────────────────────────────────────────
 echo "==> Installing services..."
 LAUNCH_CMD="$VENV/bin/python3 $AGENT_DIR/main.py"
 
 if [[ "$OS" == "darwin" ]]; then
-    # Nebula service
+    # ── macOS: launchd ────────────────────────────────────────────────────────
     sudo tee /Library/LaunchDaemons/com.mothership.nebula.plist > /dev/null << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -504,7 +489,6 @@ PLISTEOF
     sudo launchctl load /Library/LaunchDaemons/com.mothership.nebula.plist 2>/dev/null \
         || sudo launchctl kickstart -k system/com.mothership.nebula
 
-    # Agent service (user launchd, no sudo)
     mkdir -p "$HOME/Library/LaunchAgents"
     tee "$HOME/Library/LaunchAgents/com.mothership.child.plist" > /dev/null << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -526,8 +510,17 @@ PLISTEOF
     launchctl load "$HOME/Library/LaunchAgents/com.mothership.child.plist" 2>/dev/null \
         || launchctl kickstart -k "gui/$(id -u)/com.mothership.child"
 
-elif command -v systemctl &>/dev/null; then
-    # Nebula
+    echo ""
+    echo "==========================================="
+    echo "  Child setup complete! (macOS)"
+    echo "==========================================="
+    echo ""
+    echo "  Start:  launchctl start com.mothership.child"
+    echo "  Stop:   launchctl stop  com.mothership.child"
+    echo "  Logs:   tail -f $AGENT_DIR/child.log"
+
+else
+    # ── Linux: systemd ────────────────────────────────────────────────────────
     sudo tee /etc/systemd/system/nebula.service > /dev/null << SVCEOF
 [Unit]
 Description=Nebula overlay network
@@ -539,7 +532,6 @@ Restart=always
 WantedBy=multi-user.target
 SVCEOF
 
-    # Agent
     sudo tee /etc/systemd/system/mothership-child.service > /dev/null << SVCEOF
 [Unit]
 Description=Mothership child agent
@@ -555,21 +547,14 @@ WantedBy=multi-user.target
 SVCEOF
     sudo systemctl daemon-reload
     sudo systemctl enable --now nebula mothership-child
-fi
 
-# ── 5. Summary ────────────────────────────────────────────────────────────────
-echo ""
-echo "==========================================="
-echo "  Child setup complete!"
-echo "==========================================="
-echo ""
-if [[ "$OS" == "darwin" ]]; then
-    echo "  Start:  launchctl start com.mothership.child"
-    echo "  Stop:   launchctl stop com.mothership.child"
-    echo "  Logs:   tail -f $AGENT_DIR/child.log"
-else
+    echo ""
+    echo "==========================================="
+    echo "  Child setup complete! (Linux)"
+    echo "==========================================="
+    echo ""
     echo "  Start:  sudo systemctl start mothership-child"
-    echo "  Stop:   sudo systemctl stop mothership-child"
+    echo "  Stop:   sudo systemctl stop  mothership-child"
     echo "  Logs:   journalctl -fu mothership-child"
 fi
 echo ""
@@ -740,11 +725,12 @@ logging:
   format: text
 YAMLEOF
 
-# ── Start Nebula on mother ─────────────────────────────────────────────────────
+# ── Start Nebula on mother ────────────────────────────────────────────────────
 echo "==> Starting Nebula on mother..."
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+OS_MOTHER="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
-if [[ "$OS" == "darwin" ]]; then
+if [[ "$OS_MOTHER" == "darwin" ]]; then
+    # ── macOS: launchd ────────────────────────────────────────────────────────
     PLIST=/Library/LaunchDaemons/com.mothership.nebula.plist
     sudo tee "$PLIST" > /dev/null << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -766,8 +752,10 @@ if [[ "$OS" == "darwin" ]]; then
 </plist>
 PLISTEOF
     sudo launchctl load "$PLIST" 2>/dev/null || sudo launchctl kickstart -k "system/com.mothership.nebula"
+    echo "    Nebula running via launchd. Logs: /var/log/nebula.log"
 
 elif command -v systemctl &>/dev/null; then
+    # ── Linux: systemd ────────────────────────────────────────────────────────
     sudo tee /etc/systemd/system/nebula.service > /dev/null << SVCEOF
 [Unit]
 Description=Nebula overlay network
@@ -782,10 +770,12 @@ WantedBy=multi-user.target
 SVCEOF
     sudo systemctl daemon-reload
     sudo systemctl enable --now nebula
+    echo "    Nebula running via systemd. Logs: journalctl -fu nebula"
 
 else
+    # ── Fallback: background process ──────────────────────────────────────────
     sudo nohup /usr/local/bin/nebula -config "$NEBULA_ETC/config.yml" > /var/log/nebula.log 2>&1 &
-    echo "  Nebula started in background. Logs: /var/log/nebula.log"
+    echo "    Nebula started in background (no init system found). Logs: /var/log/nebula.log"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

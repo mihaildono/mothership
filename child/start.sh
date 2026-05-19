@@ -1,35 +1,34 @@
 #!/usr/bin/env bash
-# Start the hub agent, running any missing setup steps first.
+# Start the child agent (macOS + Linux).
+# Installs missing dependencies automatically on first run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
-
-# ── Homebrew ──────────────────────────────────────────────────────────────────
-if ! command -v brew &>/dev/null; then
-    echo "==> Homebrew not found — running setup first..."
-    bash "$SCRIPT_DIR/setup.sh"
-    exec bash "$0" "$@"   # re-exec so PATH includes brew
-fi
-
-# ── Python ────────────────────────────────────────────────────────────────────
-if ! command -v python3 &>/dev/null; then
-    echo "==> Python not found — installing..."
-    brew install python
-fi
+OS="$(uname -s)"
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
-if ! command -v ollama &>/dev/null; then
+if ! command -v ollama &>/dev/null && [[ -z "$(find /opt/homebrew/bin /usr/local/bin /usr/bin -name ollama 2>/dev/null)" ]]; then
     echo "==> Ollama not found — installing..."
-    brew install ollama
+    if [[ "$OS" == "Darwin" ]]; then
+        if command -v brew &>/dev/null; then
+            brew install ollama
+        else
+            echo "  Homebrew not found. Install Ollama from https://ollama.ai or install Homebrew first."
+            exit 1
+        fi
+    else
+        # Linux — official install script
+        curl -fsSL https://ollama.ai/install.sh | sh
+    fi
 fi
 
-# ── uv (Python toolchain manager) ────────────────────────────────────────────
+# ── uv ────────────────────────────────────────────────────────────────────────
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv &>/dev/null; then
     echo "==> Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source "$HOME/.local/bin/env"
+    source "$HOME/.local/bin/env" 2>/dev/null || export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # ── Virtual environment ───────────────────────────────────────────────────────

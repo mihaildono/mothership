@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mother setup script — macOS
+# Mother setup script — macOS + Linux
 # Installs uv, creates a venv with Python 3.12, and installs dependencies.
 set -euo pipefail
 
