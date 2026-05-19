@@ -87,6 +87,21 @@ def _load_child_tokens() -> dict[str, str]:
 
 _CHILD_TOKENS: dict[str, str] = _load_child_tokens()
 
+# ── Display name registry ─────────────────────────────────────────────────────
+_NAMES_FILE = Path(__file__).parent / "child-names.json"
+
+
+def _load_names() -> dict[str, str]:
+    """Load child_id → display name mapping from child-names.json."""
+    if not _NAMES_FILE.exists():
+        return {}
+    try:
+        import json as _json
+
+        return _json.loads(_NAMES_FILE.read_text())
+    except Exception:
+        return {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -142,7 +157,12 @@ async def ws_child(ws: WebSocket):
                 await ws.close(code=4003, reason="Invalid auth_token")
                 return
 
-        await registry.register(child_id, ws, model=msg.get("model", "unknown"))
+        await registry.register(
+            child_id,
+            ws,
+            model=msg.get("model", "unknown"),
+            name=_load_names().get(child_id, child_id),
+        )
 
         # Message loop
         async for raw in ws.iter_text():

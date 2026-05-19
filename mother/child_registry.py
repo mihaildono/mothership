@@ -24,6 +24,7 @@ class ChildEntry:
     ws: "WebSocketServerProtocol"
     status: str = "idle"  # idle | busy | offline
     model: str = "unknown"  # Ollama model reported at registration
+    name: str = ""  # human-friendly display name (from mother/child-names.json)
     connected_at: datetime = field(default_factory=datetime.utcnow)
     last_seen: datetime = field(default_factory=datetime.utcnow)
     last_ping_ms: float | None = None  # round-trip latency of last health check
@@ -35,10 +36,16 @@ class ChildRegistry:
         self._lock = asyncio.Lock()
 
     async def register(
-        self, child_id: str, ws: "WebSocketServerProtocol", model: str = "unknown"
+        self,
+        child_id: str,
+        ws: "WebSocketServerProtocol",
+        model: str = "unknown",
+        name: str = "",
     ) -> None:
         async with self._lock:
-            self._children[child_id] = ChildEntry(child_id=child_id, ws=ws, model=model)
+            self._children[child_id] = ChildEntry(
+                child_id=child_id, ws=ws, model=model, name=name or child_id
+            )
         logger.info(
             "Child registered: %s  (total active: %d)", child_id, len(self._children)
         )
@@ -67,6 +74,7 @@ class ChildRegistry:
         return [
             {
                 "child_id": e.child_id,
+                "name": e.name,
                 "status": e.status,
                 "model": e.model,
                 "connected_at": e.connected_at.isoformat(),

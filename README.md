@@ -3,12 +3,12 @@
 A distributed AI hub where a single **mother** machine orchestrates multiple **child** machines, each running a local Ollama model. Tasks are submitted to the mother via REST API and dispatched to available children over an encrypted peer-to-peer overlay network (Nebula).
 
 ```
-You / CLI
+You / manage.py
     │  HTTP REST  (X-API-Key)
     ▼
 ┌──────────────┐   WebSocket over Nebula tunnel   ┌─────────────────┐
 │   Mother     │◄────────────────────────────────►│  Child (×N)     │
-│  FastAPI     │                                  │  Ollama + Gemma │
+│  FastAPI     │                                  │  Ollama (auto)  │
 │  Port 8765   │                                  │  Port 8766      │
 └──────────────┘                                  └─────────────────┘
        ▲
@@ -60,8 +60,7 @@ For multiple children:
 ### 3. Start the mother server
 
 ```bash
-cd mother
-./start.sh
+python3 manage.py mother start
 ```
 
 The server starts on port **8765**.
@@ -92,7 +91,7 @@ curl -fsSL "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" \
 7. Registers the agent as a boot service
 
 > **The download token is one-time use and expires after 10 minutes.**
-> Regenerate it with `./manage-child.sh retoken child-001` if it expires.
+> Regenerate it with `python3 manage.py token retoken child-001` if it expires.
 
 ### Start / stop the child agent
 
@@ -119,6 +118,15 @@ tail -f ~/mothership-child/child.log
 **Linux:**
 ```bash
 journalctl -fu mothership-child
+```
+
+### Local dev (same machine)
+
+```bash
+python3 manage.py child start          # start child agent
+python3 manage.py child stop           # stop it
+python3 manage.py child detect-model   # run whichllm without starting
+python3 manage.py child logs -n 100    # tail logs
 ```
 
 ---
@@ -155,6 +163,50 @@ Children connect outbound — no ports need to be open on child machines.
 
 ---
 
+## manage.py — control CLI
+
+`manage.py` is a zero-dependency Python CLI that works on macOS, Linux, and Windows.
+
+```bash
+# Mother
+python3 manage.py mother start           # start orchestrator
+python3 manage.py mother stop            # stop it
+python3 manage.py mother status          # show connected children + models
+
+# Child (local dev)
+python3 manage.py child start            # start local child agent
+python3 manage.py child stop             # stop it
+python3 manage.py child detect-model     # run whichllm hardware detection
+python3 manage.py child logs -n 100      # tail logs
+
+# Child naming
+python3 manage.py child list                          # list all named children
+python3 manage.py child name child-001 "Gaming PC"    # set a display name
+python3 manage.py child rename child-001 "Beast Box"  # rename
+python3 manage.py child remove child-001              # remove + revoke token
+
+# Setup
+python3 manage.py nebula setup           # full mother + Nebula + bundle setup
+
+# Bundles
+python3 manage.py bundle list            # list available bundles
+
+# Tokens
+python3 manage.py token list             # list all child tokens
+python3 manage.py token add child-002    # add a new child
+python3 manage.py token revoke child-001 # revoke access immediately
+python3 manage.py token retoken child-001 # regenerate token + download link
+
+# Send a prompt (blocks until result)
+python3 manage.py send child-001 "Explain quantum computing"
+python3 manage.py send child-001 "Hello" --timeout 60 --host 10.10.0.1
+```
+
+> **Names** are stored in `mother/child-names.json`. They are display-only — renaming never touches Nebula certs or the child's config.
+> Restart the mother after naming or renaming for the change to appear in `mother status`.
+
+---
+
 ## API reference
 
 All endpoints (except `/bundle`) require the `X-API-Key` header.
@@ -173,6 +225,7 @@ Example response:
   {
     "child_id": "child-001",
     "status": "idle",
+    "model": "qwen3:14b",
     "connected_at": "2026-05-14T14:00:00",
     "last_ping_ms": 3.2
   }
@@ -208,7 +261,7 @@ Returns `404` while the task is still running. When done:
 ```json
 {
   "child_id": "child-001",
-  "result":   "🚀 The future of AI is distributed...",
+  "result":   "The future of AI is distributed...",
   "error":    null
 }
 ```
@@ -217,18 +270,18 @@ Returns `404` while the task is still running. When done:
 
 ## Token management
 
-All token operations are run on the **mother machine** from the `nebula/` directory.
+All token operations work from the repo root via `manage.py` (or directly via `nebula/manage-child.sh` on bash systems).
 
 ### List all children
 
 ```bash
-./manage-child.sh list
+python3 manage.py token list
 ```
 
 ### Add a new child
 
 ```bash
-./manage-child.sh add child-002
+python3 manage.py token add child-002
 ```
 
 Generates a Nebula cert, an auth token, and a bundle with a one-time download link.
@@ -237,20 +290,20 @@ Restart the mother to apply the new token.
 ### Revoke a child immediately
 
 ```bash
-./manage-child.sh revoke child-001
+python3 manage.py token revoke child-001
 ```
 
 Removes the auth token from `mother/.env` and deletes its bundle.
 Restart the mother — the child will be rejected on its next reconnect attempt.
 
 ```bash
-cd ../mother && ./start.sh
+python3 manage.py mother start
 ```
 
 ### Rotate a child's auth token
 
 ```bash
-./manage-child.sh retoken child-001
+python3 manage.py token retoken child-001
 ```
 
 Generates a new auth token + a fresh 10-minute bundle download link.
@@ -278,9 +331,11 @@ Keys are stored in `mother/.env` (gitignored). Never commit this file.
 
 ```
 mothership/
+├── manage.py              # Cross-platform control CLI (macOS/Linux/Windows)
+│
 ├── mother/
 │   ├── main.py            # FastAPI server — WS endpoint + REST API
-│   ├── child_registry.py  # In-memory registry of connected children
+│   ├── child_registry.py  # In-memory registry of connected children (+ model)
 │   ├── health.py          # PING/PONG health-check loop
 │   ├── requirements.txt
 │   ├── start.sh           # Start the mother (loads .env automatically)
@@ -291,7 +346,8 @@ mothership/
 │   ├── main.py            # FastAPI + lifespan: starts Ollama + WS client
 │   ├── ws_client.py       # Persistent WebSocket client with reconnect
 │   ├── ollama_runner.py   # Start/stop Ollama subprocess + run inference
-│   ├── config.py          # TOML config loader
+│   ├── model_detector.py  # whichllm hardware detection + HF→Ollama mapping
+│   ├── config.py          # TOML config loader + update_model()
 │   ├── config.toml        # Generated by setup — KEEP SECRET
 │   ├── config.toml.example
 │   ├── requirements.txt
@@ -306,8 +362,6 @@ mothership/
 │   ├── certs/             # CA + node certs (gitignored)
 │   ├── bundles/           # Child bundles + tokens (gitignored)
 │   └── bin/               # Downloaded Nebula binaries (gitignored)
-│
-└── plan.md                # Architecture plan
 ```
 
 ---
@@ -316,7 +370,7 @@ mothership/
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `CHILD_REGISTER` | child → mother | First message on connect. Includes `child_id` and `auth_token`. |
+| `CHILD_REGISTER` | child → mother | First message on connect. Includes `child_id`, `auth_token`, and `model`. |
 | `CHILD_STATUS` | child → mother | Status update: `idle` or `busy` |
 | `TASK_REQUEST` | mother → child | `{type, task_id, payload}` |
 | `TASK_RESULT` | child → mother | `{type, task_id, result, error}` |
