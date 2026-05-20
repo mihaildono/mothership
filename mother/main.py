@@ -42,6 +42,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, field_validator
 
 from child_registry import ChildRegistry
+import database
 import health as health_module
 
 logging.basicConfig(
@@ -112,10 +113,10 @@ def _load_names() -> dict[str, str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.results = {}
     if not _MOTHER_API_KEY:
         raise RuntimeError("MOTHER_API_KEY env var is required but not set")
     logger.info("Mother starting up...")
+    database.init()
     health_task = asyncio.create_task(health_module.run(registry))
     yield
     health_task.cancel()
@@ -123,6 +124,7 @@ async def lifespan(app: FastAPI):
         await health_task
     except asyncio.CancelledError:
         pass
+    database.close()
     logger.info("Mother shut down.")
 
 
@@ -161,19 +163,20 @@ async def ws_child(ws: WebSocket):
                 logger.warning(
                     "No token configured for child '%s' — rejecting", child_id
                 )
+                await database.log_event(child_id, "auth_fail", "no token configured")
                 await ws.close(code=4003, reason="Child not authorised")
                 return
             if not secrets.compare_digest(supplied, expected):
                 logger.warning("Auth failed for child '%s' — rejecting", child_id)
+                await database.log_event(child_id, "auth_fail", "token mismatch")
                 await ws.close(code=4003, reason="Invalid auth_token")
                 return
 
-        await registry.register(
-            child_id,
-            ws,
-            model=msg.get("model", "unknown"),
-            name=_load_names().get(child_id, child_id),
-        )
+        child_name = _load_names().get(child_id, child_id)
+        child_model = msg.get("model", "unknown")
+        await registry.register(child_id, ws, model=child_model, name=child_name)
+        await database.upsert_child(child_id, child_name, child_model)
+        await database.log_event(child_id, "connect", f"model={child_model}")
 
         # Message loop
         async for raw in ws.iter_text():
@@ -184,11 +187,14 @@ async def ws_child(ws: WebSocket):
         pass
     except asyncio.TimeoutError:
         logger.warning("Child did not register in time — closing connection")
+        if child_id:
+            await database.log_event(child_id, "auth_fail", "registration timeout")
         await ws.close(code=4002, reason="Registration timeout")
     except Exception as e:
         logger.error("Unexpected error with child %s: %s", child_id, e)
     finally:
         if child_id:
+            await database.log_event(child_id, "disconnect")
             await registry.remove(child_id)
 
 
@@ -213,12 +219,10 @@ async def _handle_message(child_id: str, msg: dict) -> None:
             logger.error("Task %s failed on %s: %s", task_id, child_id, error)
         else:
             logger.info("Task %s result from %s: %.120s...", task_id, child_id, result)
-        # Store in app state for polling by /send endpoint
-        app.state.results[task_id] = {
-            "child_id": child_id,
-            "result": result,
-            "error": error,
-        }
+        # Persist result to DB — this is the single source of truth.
+        # /result/{task_id} polls SQLite directly so large outputs never
+        # accumulate in memory.
+        await database.complete_task(task_id, result, error)
 
     else:
         logger.debug("Unknown message type '%s' from %s", msg_type, child_id)
@@ -245,6 +249,8 @@ async def kick_child(child_id: str) -> JSONResponse:
     except Exception:
         pass
     await registry.remove(child_id)
+    await database.log_event(child_id, "kick", "removed by operator")
+    await database.log_command("kick", child_id=child_id)
     logger.info("Child '%s' kicked by operator", child_id)
     return JSONResponse({"kicked": True, "child_id": child_id})
 
@@ -290,16 +296,93 @@ async def send_to_child(body: SendRequest) -> JSONResponse:
         }
     )
     await entry.ws.send_text(payload)
+    await database.record_task(body.task_id, body.child_id, body.prompt)
+    await database.log_command(
+        "send", child_id=body.child_id, detail=f"task_id={body.task_id}"
+    )
     logger.info("Sent task %s to %s", body.task_id, body.child_id)
     return JSONResponse({"queued": True, "task_id": body.task_id})
 
 
 @app.get("/result/{task_id}", dependencies=[Depends(_require_api_key)])
 async def get_result(task_id: str) -> JSONResponse:
-    result = app.state.results.get(task_id)
-    if result is None:
+    """Poll for a task result. Returns 404 while still pending."""
+    if not task_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid task_id")
+    row = await database.get_task(task_id)
+    if row is None or row["status"] == "pending":
         raise HTTPException(status_code=404, detail="Result not ready yet")
-    return JSONResponse(result)
+    return JSONResponse(
+        {
+            "child_id": row["child_id"],
+            "result": row["result"],
+            "error": row["error"],
+        }
+    )
+
+
+# ── History / stats endpoints ────────────────────────────────────────────────
+
+
+@app.get("/history/tasks", dependencies=[Depends(_require_api_key)])
+async def history_tasks(
+    child_id: str | None = None,
+    limit: int = 50,
+    status: str | None = None,
+) -> JSONResponse:
+    """Recent task history (last N tasks, optionally filtered by child or status)."""
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=400, detail="limit must be 1–1000")
+    rows = await database.get_tasks(child_id=child_id, limit=limit, status=status)
+    return JSONResponse(rows)
+
+
+@app.get("/history/events", dependencies=[Depends(_require_api_key)])
+async def history_events(
+    child_id: str | None = None,
+    limit: int = 100,
+    event_type: str | None = None,
+) -> JSONResponse:
+    """Recent connection/event log."""
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=400, detail="limit must be 1–1000")
+    rows = await database.get_events(
+        child_id=child_id, limit=limit, event_type=event_type
+    )
+    return JSONResponse(rows)
+
+
+@app.get("/history/commands", dependencies=[Depends(_require_api_key)])
+async def history_commands(
+    child_id: str | None = None,
+    limit: int = 50,
+) -> JSONResponse:
+    """Recent operator commands."""
+    rows = await database.get_commands(limit=limit, child_id=child_id)
+    return JSONResponse(rows)
+
+
+@app.get("/stats", dependencies=[Depends(_require_api_key)])
+async def stats() -> JSONResponse:
+    """Aggregate statistics: task counts, child counts, event totals."""
+    return JSONResponse(await database.get_stats())
+
+
+@app.get("/children/known", dependencies=[Depends(_require_api_key)])
+async def list_known_children() -> JSONResponse:
+    """All children ever seen (from DB), including currently offline ones."""
+    return JSONResponse(await database.list_children())
+
+
+@app.get("/tasks/{task_id}", dependencies=[Depends(_require_api_key)])
+async def get_task(task_id: str) -> JSONResponse:
+    """Fetch a single task record by ID (including full result)."""
+    if not task_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid task_id")
+    row = await database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return JSONResponse(row)
 
 
 # ── Bundle distribution ───────────────────────────────────────────────────────

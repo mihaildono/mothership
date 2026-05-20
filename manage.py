@@ -606,6 +606,193 @@ def send_prompt(args: argparse.Namespace) -> int:
     return 1
 
 
+# ── DB commands (read directly from SQLite, no server needed) ─────────────────
+
+_DB_PATH = MOTHER_DIR / "mothership.db"
+
+import sqlite3 as _sqlite3
+import datetime as _dt
+
+
+def _db_connect() -> "_sqlite3.Connection":
+    if not _DB_PATH.exists():
+        print(f"ERROR: Database not found at {_DB_PATH}")
+        print("       Start the mother at least once to create the database.")
+        sys.exit(1)
+    conn = _sqlite3.connect(str(_DB_PATH))
+    conn.row_factory = _sqlite3.Row
+    return conn
+
+
+def _fmt_ts(ts: float | None) -> str:
+    if ts is None:
+        return "—"
+    return _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def db_stats(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    row = conn.execute("SELECT COUNT(*) AS n FROM children").fetchone()
+    total_children = row["n"]
+
+    t = conn.execute(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok, "
+        "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors, "
+        "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending "
+        "FROM tasks"
+    ).fetchone()
+
+    ev = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
+    cmd = conn.execute("SELECT COUNT(*) AS n FROM commands").fetchone()
+    conn.close()
+
+    print("=== Mothership stats ===")
+    print(f"  Known children : {total_children}")
+    print(f"  Tasks total    : {t['total'] or 0}")
+    print(f"    OK           : {t['ok'] or 0}")
+    print(f"    Errors       : {t['errors'] or 0}")
+    print(f"    Pending      : {t['pending'] or 0}")
+    print(f"  Events logged  : {ev['n']}")
+    print(f"  Commands logged: {cmd['n']}")
+    return 0
+
+
+def db_tasks(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    clauses, params = [], []
+    if args.child_id:
+        clauses.append("child_id = ?")
+        params.append(args.child_id)
+    if args.status:
+        clauses.append("status = ?")
+        params.append(args.status)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT task_id, child_id, status, queued_at, finished_at, "
+        f"SUBSTR(prompt,1,80) AS prompt_preview "
+        f"FROM tasks {where} ORDER BY queued_at DESC LIMIT ?",
+        tuple(params) + (args.limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No tasks found.")
+        return 0
+
+    print(f"{'TASK ID':<20} {'CHILD':<14} {'STATUS':<8} {'QUEUED':<20} {'PROMPT'}")
+    print("-" * 90)
+    for r in rows:
+        elapsed = ""
+        if r["finished_at"] and r["queued_at"]:
+            elapsed = f" ({r['finished_at']-r['queued_at']:.1f}s)"
+        print(
+            f"{r['task_id']:<20} {r['child_id']:<14} {r['status']:<8} "
+            f"{_fmt_ts(r['queued_at']):<20}{elapsed}  {r['prompt_preview']!r}"
+        )
+    return 0
+
+
+def db_task(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE task_id = ?", (args.task_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        print(f"Task '{args.task_id}' not found.")
+        return 1
+    print(f"Task ID   : {row['task_id']}")
+    print(f"Child     : {row['child_id']}")
+    print(f"Status    : {row['status']}")
+    print(f"Queued    : {_fmt_ts(row['queued_at'])}")
+    print(f"Finished  : {_fmt_ts(row['finished_at'])}")
+    print(f"\nPrompt:\n{row['prompt']}")
+    if row["result"]:
+        print(f"\nResult:\n{row['result']}")
+    if row["error"]:
+        print(f"\nError:\n{row['error']}")
+    return 0
+
+
+def db_events(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    clauses, params = [], []
+    if args.child_id:
+        clauses.append("child_id = ?")
+        params.append(args.child_id)
+    if args.event_type:
+        clauses.append("event_type = ?")
+        params.append(args.event_type)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM events {where} ORDER BY ts DESC LIMIT ?",
+        tuple(params) + (args.limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No events found.")
+        return 0
+
+    print(f"{'TIME':<22} {'CHILD':<14} {'EVENT':<14} {'DETAIL'}")
+    print("-" * 70)
+    for r in rows:
+        print(
+            f"{_fmt_ts(r['ts']):<22} {r['child_id']:<14} {r['event_type']:<14} {r['detail']}"
+        )
+    return 0
+
+
+def db_commands(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    clauses, params = [], []
+    if args.child_id:
+        clauses.append("child_id = ?")
+        params.append(args.child_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM commands {where} ORDER BY ts DESC LIMIT ?",
+        tuple(params) + (args.limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No commands found.")
+        return 0
+
+    print(f"{'TIME':<22} {'COMMAND':<16} {'CHILD':<14} {'DETAIL'}")
+    print("-" * 70)
+    for r in rows:
+        child = r["child_id"] or "—"
+        print(f"{_fmt_ts(r['ts']):<22} {r['command']:<16} {child:<14} {r['detail']}")
+    return 0
+
+
+def db_known_children(args: argparse.Namespace) -> int:
+    conn = _db_connect()
+    rows = conn.execute(
+        "SELECT child_id, name, model, first_seen, last_seen, total_connects, total_tasks "
+        "FROM children ORDER BY last_seen DESC"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No children in database.")
+        return 0
+
+    print(
+        f"{'CHILD ID':<16} {'NAME':<24} {'MODEL':<18} {'CONNECTS':>8} {'TASKS':>6} {'LAST SEEN'}"
+    )
+    print("-" * 95)
+    for r in rows:
+        print(
+            f"{r['child_id']:<16} {r['name']:<24} {r['model']:<18} "
+            f"{r['total_connects']:>8} {r['total_tasks']:>6}  {_fmt_ts(r['last_seen'])}"
+        )
+    return 0
+
+
 # ── CLI parser ────────────────────────────────────────────────────────────────
 
 
@@ -705,6 +892,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=int, default=120, help="Seconds to wait for result"
     )
     s.set_defaults(func=send_prompt)
+
+    # db
+    d = sub.add_parser("db", help="Query the mother's SQLite database")
+    d_sub = d.add_subparsers(dest="action", required=True)
+
+    d_stats = d_sub.add_parser("stats", help="Show aggregate statistics")
+    d_stats.set_defaults(func=db_stats)
+
+    d_tasks = d_sub.add_parser("tasks", help="List recent tasks")
+    d_tasks.add_argument(
+        "--child", dest="child_id", default=None, help="Filter by child ID"
+    )
+    d_tasks.add_argument("--status", default=None, choices=["pending", "ok", "error"])
+    d_tasks.add_argument("-n", "--limit", type=int, default=20)
+    d_tasks.set_defaults(func=db_tasks)
+
+    d_task = d_sub.add_parser("task", help="Show full detail for one task")
+    d_task.add_argument("task_id")
+    d_task.set_defaults(func=db_task)
+
+    d_events = d_sub.add_parser("events", help="Show connection/event log")
+    d_events.add_argument("--child", dest="child_id", default=None)
+    d_events.add_argument(
+        "--type",
+        dest="event_type",
+        default=None,
+        choices=["connect", "disconnect", "kick", "auth_fail", "register"],
+    )
+    d_events.add_argument("-n", "--limit", type=int, default=30)
+    d_events.set_defaults(func=db_events)
+
+    d_cmds = d_sub.add_parser("commands", help="Show operator command log")
+    d_cmds.add_argument("--child", dest="child_id", default=None)
+    d_cmds.add_argument("-n", "--limit", type=int, default=30)
+    d_cmds.set_defaults(func=db_commands)
+
+    d_known = d_sub.add_parser(
+        "children", help="All known children (including offline)"
+    )
+    d_known.set_defaults(func=db_known_children)
 
     return parser
 
