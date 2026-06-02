@@ -13,6 +13,9 @@ mother/.env
 *.db
 *.sqlite3
 
+# Temporary extracted bundles
+child/temp/
+
 # Nebula private keys, signed certs, child bundles and tokens — never commit these
 nebula/certs/
 nebula/bundles/
