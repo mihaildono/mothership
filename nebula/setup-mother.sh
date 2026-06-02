@@ -47,17 +47,40 @@ for arg in "$@"; do
 done
 
 if [[ -z "$PUBLIC_IP" ]]; then
-    echo "==> No PUBLIC_IP provided — detecting automatically..."
-    PUBLIC_IP="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    if [[ -z "$PUBLIC_IP" ]]; then
-        echo ""
-        echo "  Could not auto-detect public IP."
-        echo "  Usage: $0 <PUBLIC_IP> [--children child-001,child-002,...]"
-        echo ""
-        echo "  Run 'curl https://api.ipify.org' to find your public IP."
-        exit 1
-    fi
-    echo "    Detected public IP: $PUBLIC_IP"
+    LOCAL_IP="$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    PUBLIC_IP_DETECTED="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+
+    echo ""
+    echo "==> Where will children connect to this mother?"
+    echo ""
+    echo "  1) localhost / same machine  (127.0.0.1)"
+    echo "  2) Local network             (${LOCAL_IP:-not detected})"
+    echo "  3) Public internet           (${PUBLIC_IP_DETECTED:-not detected})"
+    echo "  4) Enter manually"
+    echo ""
+    read -rp "  Choice [1-4]: " _IP_CHOICE
+
+    case "$_IP_CHOICE" in
+        1) PUBLIC_IP="127.0.0.1" ;;
+        2)
+            if [[ -z "$LOCAL_IP" ]]; then
+                echo "Could not detect local IP. Please enter manually."
+                read -rp "  Local IP: " PUBLIC_IP
+            else
+                PUBLIC_IP="$LOCAL_IP"
+            fi
+            ;;
+        3)
+            if [[ -z "$PUBLIC_IP_DETECTED" ]]; then
+                echo "Could not detect public IP. Please enter manually."
+                read -rp "  Public IP: " PUBLIC_IP
+            else
+                PUBLIC_IP="$PUBLIC_IP_DETECTED"
+            fi
+            ;;
+        4) read -rp "  Enter IP or hostname: " PUBLIC_IP ;;
+        *) echo "Invalid choice."; exit 1 ;;
+    esac
     echo ""
 fi
 
@@ -98,6 +121,22 @@ detect_download() {
 
 read -r ASSET FORMAT <<< "$(detect_download)"
 DOWNLOAD_URL="https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/${ASSET}"
+
+# ── Pre-generate download tokens (1-hour TTL) ─────────────────────────────────
+# Done first so the token is ready before the lengthy setup begins.
+mkdir -p "$BUNDLES_DIR"
+IFS=',' read -ra _EARLY_LIST <<< "$CHILDREN"
+for _cid in "${_EARLY_LIST[@]}"; do
+    _TOK_FILE="$BUNDLES_DIR/${_cid}.token"
+    python3 - "$_TOK_FILE" << 'PYEOF'
+import sys, json, secrets, time
+data = {"token": secrets.token_hex(24), "expires_at": time.time() + 3600}
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f)
+PYEOF
+    chmod 600 "$_TOK_FILE"
+    echo "==> Token pre-generated for ${_cid} (valid 1 hour)"
+done
 
 # ── Download Nebula binaries ──────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
@@ -280,7 +319,7 @@ work_start = "00:00"
 work_end   = "23:59"
 
 [mother]
-host    = "${MOTHER_IP}"
+host    = "${PUBLIC_IP}"
 ws_port = 8765
 
 [ollama]
@@ -299,7 +338,7 @@ set -euo pipefail
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 NEBULA_ETC="/etc/nebula"
 NEBULA_BIN="/usr/local/bin/nebula"
-AGENT_DIR="$HOME/mothership-child"
+AGENT_DIR="$BUNDLE_DIR/agent"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
@@ -341,10 +380,8 @@ sudo install -m 600 "$BUNDLE_DIR/nebula/node.crt"   "$NEBULA_ETC/node.crt"
 sudo install -m 600 "$BUNDLE_DIR/nebula/node.key"   "$NEBULA_ETC/node.key"
 sudo install -m 644 "$BUNDLE_DIR/nebula/config.yml" "$NEBULA_ETC/config.yml"
 
-# ── 2. Install agent ──────────────────────────────────────────────────────────
-echo "==> Installing child agent to $AGENT_DIR..."
-mkdir -p "$AGENT_DIR"
-cp -r "$BUNDLE_DIR/agent/." "$AGENT_DIR/"
+# ── 2. Agent is already in $BUNDLE_DIR/agent — no copy needed ───────────────
+echo "==> Agent directory: $AGENT_DIR"
 
 # ── 3. uv + Ollama + venv + deps ─────────────────────────────────────────────
 echo "==> Setting up Python environment..."
@@ -574,11 +611,12 @@ INSTALLEOF
 #
 param([switch]$SkipNebula)
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $BundleDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$AgentDir  = "$env:USERPROFILE\mothership-child"
+$AgentDir  = "$BundleDir\agent"
 
 Write-Host "==> Mothership child setup (Windows)"
+Write-Host "  Agent directory: $AgentDir"
 
 # ── 1. Nebula (manual step on Windows) ───────────────────────────────────────
 if (-not $SkipNebula) {
@@ -598,33 +636,62 @@ if (-not $SkipNebula) {
     Write-Host "  Nebula certs installed to $nebulaConf"
 }
 
-# ── 2. Install agent ──────────────────────────────────────────────────────────
-if (-not (Test-Path $AgentDir)) { New-Item -ItemType Directory -Path $AgentDir | Out-Null }
-Copy-Item "$BundleDir\agent\*" $AgentDir -Recurse -Force
-Write-Host "  Agent installed to $AgentDir"
+# ── 2. Agent is already in $BundleDir\agent — no copy needed ────────────────
+Write-Host "  Agent ready at $AgentDir"
 
 # ── 3. uv + venv ─────────────────────────────────────────────────────────────
-$uvExe = (Get-Command uv -ErrorAction SilentlyContinue)?.Source
+$_uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+$uvExe = if ($_uvCmd) { $_uvCmd.Source } else { $null }
 if (-not $uvExe) {
     Write-Host "==> Installing uv..."
     irm https://astral.sh/uv/install.ps1 | iex
-    $uvExe = "$env:LOCALAPPDATA\Programs\uv\uv.exe"
+    # Refresh PATH so uv is available in this session
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    $_uvCmd2 = Get-Command uv -ErrorAction SilentlyContinue
+    $uvExe = if ($_uvCmd2) { $_uvCmd2.Source } else { "$env:LOCALAPPDATA\Programs\uv\uv.exe" }
 }
 $venv = "$AgentDir\.venv"
-& $uvExe venv $venv --python 3.12 --seed
-& "$venv\Scripts\python.exe" -m pip install -r "$AgentDir\requirements.txt" -q
+Write-Host "==> Ensuring Python 3.12 is available..."
+& $uvExe python install 3.12
+if (Test-Path $venv) {
+    Write-Host "  Virtual environment already exists — skipping creation."
+} else {
+    & $uvExe venv $venv --python 3.12 --seed
+}
+& $uvExe pip install -r "$AgentDir\requirements.txt" --python "$venv\Scripts\python.exe" -q
 Write-Host "  Python environment ready"
 
 # ── 4. Ollama ────────────────────────────────────────────────────────────────
-if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+# Check PATH and the known default install location (session PATH may not be updated yet)
+$ollamaExe = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+$ollamaFound = (Get-Command ollama -ErrorAction SilentlyContinue) -or (Test-Path $ollamaExe)
+if (-not $ollamaFound) {
     Write-Host "==> Installing Ollama..."
     $ollamaInstaller = "$env:TEMP\OllamaSetup.exe"
     Invoke-WebRequest "https://ollama.ai/download/OllamaSetup.exe" -OutFile $ollamaInstaller
     Start-Process $ollamaInstaller -ArgumentList "/S" -Wait
+    Write-Host "  Ollama installed."
+} else {
+    Write-Host "  Ollama already installed — skipping."
+}
+# Refresh PATH so ollama is available in this session
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+
+# ── 5. Pull Ollama model ──────────────────────────────────────────────────────
+$cfgModel = (Select-String -Path "$AgentDir\config.toml" -Pattern 'model\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+if (-not $cfgModel) { $cfgModel = "gemma3:4b" }
+Write-Host "==> Pulling Ollama model: $cfgModel (this may take a while)..."
+$_ollamaExePath = if (Get-Command ollama -ErrorAction SilentlyContinue) { (Get-Command ollama).Source } else { $ollamaExe }
+try {
+    & $_ollamaExePath pull $cfgModel
+    Write-Host "  Model ready."
+} catch {
+    Write-Host "  Warning: model pull failed. Retry manually: ollama pull $cfgModel"
 }
 
-# ── 5. Register as a Windows service (optional, requires NSSM) ───────────────
-$nssm = (Get-Command nssm -ErrorAction SilentlyContinue)?.Source
+# ── 6. Register as a Windows service (optional, requires NSSM) ───────────────
+$_nssmCmd = Get-Command nssm -ErrorAction SilentlyContinue
+$nssm = if ($_nssmCmd) { $_nssmCmd.Source } else { $null }
 if ($nssm) {
     Write-Host "==> Registering mothership-child Windows service via NSSM..."
     $python = "$venv\Scripts\python.exe"
@@ -637,9 +704,13 @@ if ($nssm) {
     Write-Host "    nssm stop  mothership-child"
 } else {
     Write-Host ""
-    Write-Host "  No service manager found (nssm). To run manually:"
-    Write-Host "    cd $AgentDir"
-    Write-Host "    .\.venv\Scripts\python.exe main.py"
+    Write-Host "  No service manager found (nssm). Run the child manually:"
+    Write-Host ""
+    Write-Host "    cd `"$AgentDir`""
+    Write-Host "    .`\.venv`\Scripts`\python.exe main.py"
+    Write-Host ""
+    Write-Host "  Or as a one-liner:"
+    Write-Host "    cd `"$AgentDir`" ; .`\.venv`\Scripts`\python.exe main.py"
     Write-Host ""
     Write-Host "  For service registration install nssm: https://nssm.cc"
 }
@@ -654,16 +725,6 @@ PS1EOF
     BUNDLE_FILE="$BUNDLES_DIR/${child_id}.tar.gz"
     tar -czf "$BUNDLE_FILE" -C "$BUNDLES_DIR" "$child_id"
     rm -rf "$BUNDLE_STAGING"
-
-    # Generate a one-time download token valid for 10 minutes
-    TOKEN_FILE="$BUNDLES_DIR/${child_id}.token"
-    python3 - "$TOKEN_FILE" << 'PYEOF'
-import sys, json, secrets, time
-data = {"token": secrets.token_hex(24), "expires_at": time.time() + 600}
-with open(sys.argv[1], "w") as f:
-    json.dump(data, f)
-PYEOF
-    chmod 600 "$TOKEN_FILE"
 
     echo "    Bundle created: $BUNDLE_FILE"
     CHILD_INDEX=$((CHILD_INDEX + 1))
@@ -794,8 +855,14 @@ IFS=',' read -ra CHILD_LIST <<< "$CHILDREN"
 for child_id in "${CHILD_LIST[@]}"; do
     child_ip="${BASE_CHILD_IP}.${CHILD_INDEX}"
     TOKEN="$(python3 -c "import json; print(json.load(open('$BUNDLES_DIR/${child_id}.token'))['token'])")"
+    BUNDLE_URL="http://${PUBLIC_IP}:8765/bundle/${child_id}?token=${TOKEN}"
     echo "  $child_id ($child_ip):"
-    echo "    curl -fsSL \"http://${PUBLIC_IP}:8765/bundle/${child_id}?token=${TOKEN}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+    echo ""
+    echo "  macOS / Linux:"
+    echo "    curl -fsSL \"${BUNDLE_URL}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+    echo ""
+    echo "  Windows (PowerShell):"
+    echo "    try { Invoke-WebRequest \"${BUNDLE_URL}\" -OutFile ${child_id}.tar.gz -ErrorAction Stop; tar -xzf ${child_id}.tar.gz } catch { Write-Host \"Bundle download skipped: \$(\$_.Exception.Message)\" }; if (Test-Path ${child_id}) { cd ${child_id} }; .\\install.ps1"
     echo ""
     CHILD_INDEX=$((CHILD_INDEX + 1))
 done

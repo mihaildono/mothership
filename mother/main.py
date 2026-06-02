@@ -167,7 +167,14 @@ async def ws_child(ws: WebSocket):
                 await ws.close(code=4003, reason="Child not authorised")
                 return
             if not secrets.compare_digest(supplied, expected):
-                logger.warning("Auth failed for child '%s' — rejecting", child_id)
+                logger.warning(
+                    "Auth failed for child '%s' — supplied=%r (len=%d) expected=%r (len=%d)",
+                    child_id,
+                    supplied[:8] + "…",
+                    len(supplied),
+                    expected[:8] + "…",
+                    len(expected),
+                )
                 await database.log_event(child_id, "auth_fail", "token mismatch")
                 await ws.close(code=4003, reason="Invalid auth_token")
                 return

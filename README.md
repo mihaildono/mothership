@@ -93,20 +93,21 @@ curl -fsSL "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" \
 
 ### Windows
 
-1. Download the bundle (PowerShell):
+One command (PowerShell — works on 5.1 and 7+):
+```powershell
+Invoke-WebRequest "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" -OutFile child-001.tar.gz; tar -xzf child-001.tar.gz; cd child-001; .\install.ps1
+```
+
+> Use `;` not `&&` — PowerShell 5.1 (the Windows default) does not support `&&` as a statement separator.
+
+Or step by step:
 ```powershell
 Invoke-WebRequest "http://<MOTHER_PUBLIC_IP>:8765/bundle/child-001?token=<TOKEN>" -OutFile child-001.tar.gz
 tar -xzf child-001.tar.gz   # requires Windows 10 1803+ or 7-Zip
 cd child-001
-```
-2. Install Nebula manually — download `nebula-windows-amd64.zip` from [github.com/slackhq/nebula/releases](https://github.com/slackhq/nebula/releases) and extract `nebula.exe` to `C:\nebula\`
-3. Run the installer (PowerShell as Administrator):
-```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 .\install.ps1
 ```
-
-`install.ps1` handles: uv, Python venv, Ollama, and optionally registers a Windows service via [NSSM](https://nssm.cc).
 
 > **The download token is one-time use and expires after 10 minutes.**
 > Regenerate it with `python3 manage.py token retoken child-001` if it expires.
