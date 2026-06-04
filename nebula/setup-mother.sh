@@ -858,12 +858,44 @@ for child_id in "${CHILD_LIST[@]}"; do
     BUNDLE_URL="http://${PUBLIC_IP}:8765/bundle/${child_id}?token=${TOKEN}"
     echo "  $child_id ($child_ip):"
     echo ""
-    echo "  macOS / Linux:"
-    echo "    curl -fsSL \"${BUNDLE_URL}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+    echo "  What OS is this child running?"
+    echo "    1) macOS"
+    echo "    2) Linux"
+    echo "    3) Windows"
     echo ""
-    echo "  Windows (PowerShell):"
-    echo "    try { Invoke-WebRequest \"${BUNDLE_URL}\" -OutFile ${child_id}.tar.gz -ErrorAction Stop; tar -xzf ${child_id}.tar.gz } catch { Write-Host \"Bundle download skipped: \$(\$_.Exception.Message)\" }; if (Test-Path ${child_id}) { cd ${child_id} }; .\\install.ps1"
-    echo ""
+    read -rp "  Choice [1-3]: " _OS_CHOICE
+
+    case "$_OS_CHOICE" in
+        1)
+            echo ""
+            echo "  Run this on the child (macOS):"
+            echo "    curl -fsSL \"${BUNDLE_URL}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+            echo ""
+            ;;
+        2)
+            echo ""
+            echo "  Run this on the child (Linux):"
+            echo "    curl -fsSL \"${BUNDLE_URL}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+            echo ""
+            ;;
+        3)
+            echo ""
+            echo "  Run this on the child (Windows PowerShell):"
+            echo "    Invoke-WebRequest \"${BUNDLE_URL}\" -OutFile ${child_id}.tar.gz; tar -xzf ${child_id}.tar.gz; cd ${child_id}; .\\install.ps1"
+            echo ""
+            ;;
+        *)
+            echo ""
+            echo "  Invalid choice — showing all options:"
+            echo ""
+            echo "  macOS / Linux:"
+            echo "    curl -fsSL \"${BUNDLE_URL}\" -o ${child_id}.tar.gz && tar -xzf ${child_id}.tar.gz && cd ${child_id} && ./install.sh"
+            echo ""
+            echo "  Windows (PowerShell):"
+            echo "    Invoke-WebRequest \"${BUNDLE_URL}\" -OutFile ${child_id}.tar.gz; tar -xzf ${child_id}.tar.gz; cd ${child_id}; .\\install.ps1"
+            echo ""
+            ;;
+    esac
     CHILD_INDEX=$((CHILD_INDEX + 1))
 done
 
